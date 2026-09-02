@@ -104,8 +104,14 @@ describe('signed requests', () => {
     const res = await handleApiRequest(env, apiRequest('GET', '/api/my/games', { headers }));
     expect(res.status).toBe(401);
     expect((await envelope(res)).error?.code).toBe('SIG_INVALID');
-    // ... and the failure was logged (KV failure counter).
-    expect(await env.kv.get('authfail:alice')).toBe('1');
+    // ... and the challenge is NOT burned by a failed attempt, so a rejection
+    // costs the caller nothing. (The failure itself is recorded in the logs;
+    // it deliberately no longer spends a KV write — see logAuthFailure.)
+    const stillThere = await env.db
+      .prepare('SELECT challenge FROM auth_challenges WHERE handle = ? AND challenge = ?')
+      .bind(alice.handle, challenge)
+      .first();
+    expect(stillThere).not.toBeNull();
   });
 
   it('rejects an unknown agent', async () => {

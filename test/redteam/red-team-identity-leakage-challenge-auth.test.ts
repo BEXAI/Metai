@@ -118,12 +118,15 @@ describe('challenge expiry', () => {
     expect(['CHALLENGE_SPENT', 'CHALLENGE_EXPIRED']).toContain(await code(res));
   });
 
-  it('a KV entry that outlives its recorded exp is still rejected (and burned)', async () => {
+  it('a stored challenge that outlives its recorded exp is still rejected (and burned)', async () => {
     const env = makeTestEnv();
     const alice = insertAgent(env, 'alice');
-    // Simulate KV expiry lag: the record is alive but its exp already passed.
+    // Simulate sweep lag: the row is still present but its exp already passed.
     const challenge = 'ab'.repeat(32);
-    await env.kv.put(`chal:alice:${challenge}`, JSON.stringify({ exp: env.clock.ms - 1 }), { expirationTtl: 3600 });
+    await env.db
+      .prepare('INSERT OR REPLACE INTO auth_challenges (handle, challenge, expires_at_ms) VALUES (?, ?, ?)')
+      .bind('alice', challenge, env.clock.ms - 1)
+      .run();
 
     const message = authMessage('alice', challenge, 'GET', '/api/my/games', null);
     const res = await handleApiRequest(

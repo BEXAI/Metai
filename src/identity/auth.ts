@@ -42,10 +42,17 @@ export type AuthOutcome = { ok: true; ctx: AuthContext } | { ok: false; res: Api
 
 export const HANDLE_RE = /^[a-z0-9][a-z0-9_-]{2,31}$/;
 
-function challengeKey(handle: string, challenge: string): string {
-  return `chal:${handle}:${challenge}`;
-}
-
+/**
+ * Challenges live in D1, NOT KV.
+ *
+ * They were briefly in KV, which cost one KV write per issued challenge. The
+ * free plan allows 1,000 KV writes/day, so a busy day of agents authenticating
+ * exhausted the quota and every subsequent challenge issuance failed — taking
+ * authentication down completely (observed in production:
+ * "KV put() limit exceeded for the day"). D1 allows ~100k writes/day, and auth
+ * must not sit on the scarcer quota. Semantics are unchanged: 32 random bytes,
+ * 5-minute lifetime, single use, burned only after a signature verifies.
+ */
 export async function issueChallenge(
   env: ApiEnv,
   handle: string,
@@ -53,10 +60,18 @@ export async function issueChallenge(
   const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
   const challenge = bytesToHex(bytes);
-  const expMs = env.now() + CHALLENGE_TTL_SECONDS * 1000;
-  await env.CACHE.put(challengeKey(handle, challenge), JSON.stringify({ exp: expMs }), {
-    expirationTtl: CHALLENGE_TTL_SECONDS,
-  });
+  const nowMs = env.now();
+  const expMs = nowMs + CHALLENGE_TTL_SECONDS * 1000;
+  await env.DB
+    .prepare('INSERT OR REPLACE INTO auth_challenges (handle, challenge, expires_at_ms) VALUES (?, ?, ?)')
+    .bind(handle, challenge, expMs)
+    .run();
+  // Opportunistic cleanup so expired rows cannot accumulate; cheap and bounded.
+  try {
+    await env.DB.prepare('DELETE FROM auth_challenges WHERE expires_at_ms < ?').bind(nowMs - 60_000).run();
+  } catch {
+    /* best effort */
+  }
   return { challenge, expires: new Date(expMs).toISOString() };
 }
 
@@ -73,15 +88,13 @@ export interface AuthRequestInfo {
   headers: { get(name: string): string | null };
 }
 
-async function logAuthFailure(env: ApiEnv, handle: string, reason: string): Promise<void> {
+/**
+ * Best-effort metric only. Deliberately does NOT write to KV: a failed-auth
+ * counter is not worth spending the scarce KV write quota that auth itself
+ * once depended on (see issueChallenge). The log line is the record.
+ */
+async function logAuthFailure(_env: ApiEnv, handle: string, reason: string): Promise<void> {
   console.warn(`auth rejected: handle=${handle} reason=${reason}`);
-  try {
-    const key = `authfail:${handle}`;
-    const cur = Number((await env.CACHE.get(key)) ?? '0');
-    await env.CACHE.put(key, String(cur + 1), { expirationTtl: 86_400 });
-  } catch {
-    /* metrics are best-effort */
-  }
 }
 
 /**
@@ -118,20 +131,17 @@ export async function authenticate(
     pubkey = agent.pubkey_ed25519;
   }
 
-  const key = challengeKey(handle, challenge);
-  const stored = await env.CACHE.get(key);
-  if (stored === null) {
+  const stored = await env.DB
+    .prepare('SELECT expires_at_ms FROM auth_challenges WHERE handle = ? AND challenge = ?')
+    .bind(handle, challenge)
+    .first<{ expires_at_ms: number }>();
+  if (!stored) {
     await logAuthFailure(env, handle, 'challenge_unknown_or_spent');
     return { ok: false, res: err(401, 'CHALLENGE_SPENT', 'Challenge unknown, already used, or expired. Challenges are single-use; fetch a new one.') };
   }
-  let exp = 0;
-  try {
-    exp = Number((JSON.parse(stored) as { exp?: unknown }).exp ?? 0);
-  } catch {
-    exp = 0;
-  }
+  const exp = Number(stored.expires_at_ms ?? 0);
   if (env.now() > exp) {
-    await env.CACHE.delete(key);
+    await env.DB.prepare('DELETE FROM auth_challenges WHERE handle = ? AND challenge = ?').bind(handle, challenge).run();
     await logAuthFailure(env, handle, 'challenge_expired');
     return { ok: false, res: err(401, 'CHALLENGE_EXPIRED', 'Challenge expired (5-minute lifetime). Fetch a new one.') };
   }
@@ -143,7 +153,7 @@ export async function authenticate(
   }
 
   // Single use: burn the challenge only after a successful verification.
-  await env.CACHE.delete(key);
+  await env.DB.prepare('DELETE FROM auth_challenges WHERE handle = ? AND challenge = ?').bind(handle, challenge).run();
 
   if (agent) return { ok: true, ctx: { agent, challenge } };
   // Registration path: synthesize a minimal context; the caller creates the row.

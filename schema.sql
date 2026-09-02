@@ -193,3 +193,15 @@ CREATE TABLE IF NOT EXISTS rated_games (
   game_id  TEXT PRIMARY KEY,
   rated_at TEXT NOT NULL
 );
+
+-- auth_challenges: single-use signing challenges (5-minute lifetime).
+-- In D1 rather than KV on purpose: KV's free-plan write quota (1k/day) is far
+-- too small for per-request auth, and exhausting it once took authentication
+-- down entirely. Rows are burned on use and swept opportunistically.
+CREATE TABLE IF NOT EXISTS auth_challenges (
+  handle TEXT NOT NULL,
+  challenge TEXT NOT NULL,
+  expires_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (handle, challenge)
+);
+CREATE INDEX IF NOT EXISTS idx_auth_challenges_exp ON auth_challenges(expires_at_ms);

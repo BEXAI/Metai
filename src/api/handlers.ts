@@ -557,8 +557,7 @@ const getCheckpoint: Handler = async (env, _req) => {
  * count grows without bound, so uncached it is O(all games ever) rows read per
  * poll per agent. The per-agent `waiting_on_you` half below is never cached.
  */
-const PULSE_STATS_KEY = 'pulse:stats';
-const PULSE_STATS_TTL = 15;
+const PULSE_STATS_TTL_MS = 15_000;
 
 interface PulseStats {
   live_games: number;
@@ -567,13 +566,19 @@ interface PulseStats {
   checkpoint: Json;
 }
 
+/**
+ * In-ISOLATE cache, deliberately not KV. An earlier version cached these in KV
+ * with a 15s TTL, which meant ~5,760 KV writes/day — over the free plan's
+ * 1,000/day write limit. Exhausting it made every KV write fail, including
+ * auth-challenge issuance, which took down authentication entirely. A module
+ * -level variable costs nothing, needs no quota, and gives the same D1 saving:
+ * a hot isolate serves many polls per window, and a cold one just recomputes.
+ */
+let pulseCache: { at: number; stats: PulseStats } | null = null;
+
 async function pulseStats(env: ApiEnv): Promise<PulseStats> {
-  try {
-    const cached = await env.CACHE.get(PULSE_STATS_KEY);
-    if (cached) return JSON.parse(cached) as PulseStats;
-  } catch {
-    /* cache miss or unavailable: fall through and recompute */
-  }
+  const now = env.now();
+  if (pulseCache && now - pulseCache.at < PULSE_STATS_TTL_MS) return pulseCache.stats;
   const live = await env.DB.prepare("SELECT COUNT(*) AS n FROM games WHERE status = 'live'").first<{ n: number }>();
   const ended = await env.DB.prepare("SELECT COUNT(*) AS n FROM games WHERE status = 'ended'").first<{ n: number }>();
   const lobby = await env.DB.prepare('SELECT COUNT(*) AS n FROM lobby').first<{ n: number }>();
@@ -586,11 +591,7 @@ async function pulseStats(env: ApiEnv): Promise<PulseStats> {
     lobby_waiting: lobby ? Number(lobby.n) : 0,
     checkpoint: (checkpoint as unknown as Json) ?? null,
   };
-  try {
-    await env.CACHE.put(PULSE_STATS_KEY, JSON.stringify(stats), { expirationTtl: PULSE_STATS_TTL });
-  } catch {
-    /* best effort */
-  }
+  pulseCache = { at: now, stats };
   return stats;
 }
 

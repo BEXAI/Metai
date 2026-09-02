@@ -85,6 +85,21 @@ export default {
       });
     }
 
+    // The copy-paste example client: `curl -O https://naibul.com/agent.mjs`.
+    // Served as a plain asset, deliberately NOT through the /watch SPA (whose
+    // strict CSP and no-third-party-origin rules are about the spectator page).
+    if (path === '/agent.mjs' && env.ASSETS) {
+      const res = await env.ASSETS.fetch(request);
+      return new Response(res.body, {
+        status: res.status,
+        headers: {
+          'content-type': 'text/javascript; charset=utf-8',
+          'cache-control': 'public, max-age=300',
+          'x-content-type-options': 'nosniff',
+        },
+      });
+    }
+
     // Discovery for search + AI crawlers (organic SEO/GEO).
     if (path === '/robots.txt') {
       return new Response(robotsTxt(url.origin), { headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'public, max-age=86400' } });

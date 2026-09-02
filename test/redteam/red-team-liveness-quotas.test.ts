@@ -29,6 +29,15 @@ import { apiRequest, envelope, insertAgent, insertHomologation, signedHeaders, t
 import { authMessage } from '../../src/identity/auth.ts';
 import { sign } from '../../src/identity/ed25519.ts';
 
+/** Challenges live in D1 (not KV): auth must not depend on the scarce KV write quota. */
+async function challengeRow(env: TestEnv, handle: string, challenge: string): Promise<unknown> {
+  return env.db
+    .prepare('SELECT challenge FROM auth_challenges WHERE handle = ? AND challenge = ?')
+    .bind(handle, challenge)
+    .first();
+}
+
+
 function joinsSpent(env: TestEnv, agent: TestAgent): number {
   const r = env.db.db.prepare('SELECT joins FROM quotas WHERE agent_id = ? AND day = ?').get(agent.agentId, utcDay(env.clock.ms)) as
     | { joins: number }
@@ -151,14 +160,14 @@ describe('rejections advance nothing (quota, challenge nonce)', () => {
     expect(joinsSpent(env, agent)).toBe(0);
     expect(lobbyCount(env)).toBe(0);
     // The nonce did NOT advance: the challenge is still alive in KV.
-    expect(await env.kv.get(`chal:${agent.handle}:${challenge}`)).not.toBeNull();
+    expect(await challengeRow(env, agent.handle, challenge)).not.toBeNull();
 
     // The legitimate retry with the SAME challenge succeeds.
     const good = await handleApiRequest(env, apiRequest('POST', '/api/lobby/join', { headers: goodHeaders, body: raw }));
     expect(good.status).toBe(201);
     expect(joinsSpent(env, agent)).toBe(1);
     // ... and only now is it single-use spent.
-    expect(await env.kv.get(`chal:${agent.handle}:${challenge}`)).toBeNull();
+    expect(await challengeRow(env, agent.handle, challenge)).toBeNull();
     const replay = await handleApiRequest(env, apiRequest('POST', '/api/lobby/join', { headers: goodHeaders, body: raw }));
     expect(replay.status).toBe(401);
     expect((await envelope(replay)).error?.code).toBe('CHALLENGE_SPENT');
@@ -181,7 +190,7 @@ describe('rejections advance nothing (quota, challenge nonce)', () => {
     expect(res.status).toBe(400);
     expect((await envelope(res)).error?.code).toBe('BAD_JSON');
     expect(joinsSpent(env, agent)).toBe(0);
-    expect(await env.kv.get(`chal:${agent.handle}:${challenge}`)).not.toBeNull();
+    expect(await challengeRow(env, agent.handle, challenge)).not.toBeNull();
 
     // Reuse the surviving challenge for a valid body (fresh signature over it).
     const raw = JSON.stringify({ game: 'toy', variant: 'standard', division: 'open' });
@@ -229,7 +238,7 @@ describe('rejections advance nothing (quota, challenge nonce)', () => {
     expect((await envelope(limited)).error?.code).toBe('RATE_LIMITED');
     expect(joinsSpent(env, agent)).toBe(0);
     expect(lobbyCount(env)).toBe(0);
-    expect(await env.kv.get(`chal:${agent.handle}:${challenge}`)).not.toBeNull();
+    expect(await challengeRow(env, agent.handle, challenge)).not.toBeNull();
 
     // Refill (1 s = 2 tokens), replay the identical request: it must succeed.
     env.clock.advance(1_000);
