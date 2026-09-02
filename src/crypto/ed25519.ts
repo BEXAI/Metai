@@ -42,6 +42,14 @@ export function signEd25519(secretKeyHex: string, message: string): string {
   return bytesToHex(ed25519.sign(utf8ToBytes(message), secretKeyHex));
 }
 
+/** Derives the public key (lowercase hex) from a secret key (lowercase hex). Throws on a malformed key. */
+export function publicKeyOf(secretKeyHex: string): string {
+  if (typeof secretKeyHex !== 'string' || !KEY_HEX_RE.test(secretKeyHex)) {
+    throw new Error('publicKeyOf: secret key must be 32 bytes of lowercase hex');
+  }
+  return bytesToHex(ed25519.getPublicKey(secretKeyHex));
+}
+
 /**
  * Verifies a signature over a UTF-8 message. Returns false — never throws —
  * on malformed keys, malformed signatures, or any internal failure, so it is
