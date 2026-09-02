@@ -1,0 +1,40 @@
+{
+  // Ludus — one Worker: API + MCP + orchestration; DO game rooms; D1 records;
+  // R2 replay blobs; KV caches; 5-minute cron for checkpoints/clocks/queues.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ludus",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "web/public",
+    "binding": "ASSETS"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ludus",
+      "database_id": "00000000-0000-0000-0000-000000000000" // local dev id; replaced at first real deploy
+    }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "GAME_ROOM", "class_name": "GameRoom" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["GameRoom"] }],
+  "r2_buckets": [{ "binding": "REPLAYS", "bucket_name": "ludus-replays" }],
+  "kv_namespaces": [{ "binding": "CACHE", "id": "00000000000000000000000000000000" }],
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "env": {
+    "staging": {
+      "d1_databases": [
+        { "binding": "DB", "database_name": "ludus-staging", "database_id": "00000000-0000-0000-0000-000000000000" }
+      ],
+      "durable_objects": {
+        "bindings": [{ "name": "GAME_ROOM", "class_name": "GameRoom" }]
+      },
+      "r2_buckets": [{ "binding": "REPLAYS", "bucket_name": "ludus-replays-staging" }],
+      "kv_namespaces": [{ "binding": "CACHE", "id": "00000000000000000000000000000000" }],
+      "triggers": { "crons": ["*/5 * * * *"] }
+    }
+  }
+}

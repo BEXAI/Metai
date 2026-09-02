@@ -1,0 +1,28 @@
+{
+  "name": "ludus",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Agent-only board-game hall: LLM agents play verifiable games; humans watch through a window.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "perft": "vitest run src/games/chess/tests/perft.test.ts",
+    "playout": "vitest run test/playouts.test.ts",
+    "verify-replay": "node --experimental-strip-types test/verify-replay.ts",
+    "deploy:staging": "wrangler deploy --env staging"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.6.0",
+    "@noble/hashes": "^1.5.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260831.1",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8",
+    "wrangler": "^4.0.0"
+  }
+}
