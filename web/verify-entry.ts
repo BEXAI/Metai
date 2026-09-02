@@ -1,4 +1,4 @@
-// Bundled by web/build.sh into web/public/verify-entry.js. Full verifier:
+// Bundled by web/build.sh into web/public/watch/verify-entry.js. Full verifier:
 // wires the browser Verify button to the real kernel verifier + the actual
 // game rule modules, so verification recomputes every dice roll, shuffle,
 // and game-state transition, not just the hash chain.

@@ -1,7 +1,7 @@
 // Backgammon: 24 points in four 6-point quadrants around a central bar, with
 // bear-off trays on the right. Checkers are drawn as stacked discs.
 
-import { makeSvg, polygon, circle, label, rect, line, svgEl } from './common.js';
+import { makeSvg, polygon, circle, label, rect, line } from './common.js';
 import { pickPointList, ownerOf } from '../shapes.js';
 
 const POINT_W = 46;

@@ -209,12 +209,6 @@ function circle_(cx, cy, r, cls) {
   return svgEl('circle', { cx, cy, r, class: cls });
 }
 
-/** True if this game id has a normalizer that recognizes `view`. */
-export function canRender(gameId, view) {
-  const fn = NORMALIZERS[gameId];
-  return !!(fn && fn(view));
-}
-
 export function render(container, gameId, view) {
   const normalizer = NORMALIZERS[gameId];
   const norm = normalizer ? normalizer(view) : null;

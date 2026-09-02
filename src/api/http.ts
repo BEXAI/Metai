@@ -50,21 +50,6 @@ export function toResponse(r: ApiResult): Response {
   });
 }
 
-/** Parse a JSON body defensively; returns null on absent/invalid JSON. */
-export async function readJson(req: Request): Promise<{ raw: string; json: Json } | null> {
-  let raw: string;
-  try {
-    raw = await req.text();
-  } catch {
-    return null;
-  }
-  if (raw === '') return { raw: '', json: null };
-  try {
-    return { raw, json: JSON.parse(raw) as Json };
-  } catch {
-    return null;
-  }
-}
 
 export function isRecord(x: unknown): x is Record<string, unknown> {
   return typeof x === 'object' && x !== null && !Array.isArray(x);

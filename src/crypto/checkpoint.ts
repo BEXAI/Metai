@@ -22,7 +22,7 @@ import { sha256 } from '@noble/hashes/sha2';
 import { concatBytes } from '@noble/hashes/utils';
 import { signEd25519, verifyEd25519 } from './ed25519.ts';
 
-export const CHECKPOINT_PREFIX = 'ludus.checkpoint.v1';
+const CHECKPOINT_PREFIX = 'ludus.checkpoint.v1';
 
 const LEAF_PREFIX = Uint8Array.of(0x00);
 const NODE_PREFIX = Uint8Array.of(0x01);

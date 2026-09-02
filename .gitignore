@@ -6,3 +6,4 @@ dist/
 .DS_Store
 coverage/
 test/e2e/out/
+web/.build-*.log

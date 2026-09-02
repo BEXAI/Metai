@@ -6,7 +6,6 @@
  */
 
 import type { Game, GameResult, Json, ParseError, PlayerId } from '../../kernel/types.ts';
-import { isParseError } from '../../kernel/types.ts';
 import { landlordMoveSummary, landlordMoveToNotation, parseLandlordMove } from './notation.ts';
 import { renderLandlord } from './render.ts';
 import {
@@ -135,9 +134,7 @@ const landlord: Game<LandlordState, LandlordMove> = {
   },
 
   parseMove(input, _state, _player): LandlordMove | ParseError {
-    const parsed = parseLandlordMove(input);
-    if (isParseError(parsed)) return parsed;
-    return parsed;
+    return parseLandlordMove(input);
   },
 
   moveToNotation(move) {

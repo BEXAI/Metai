@@ -112,6 +112,10 @@ describe('A12 SPA: strict CSP, no third-party origins', () => {
       const src = readFileSync(file, 'utf8');
       for (const hit of src.match(/https?:\/\/[^\s"'`<>)]+/g) ?? []) {
         if (hit.includes('www.w3.org')) continue; // xml namespace, not a request
+        // Self-origin SEO metadata (canonical link, og:url) must be absolute
+        // and point at the production origin; it is not a third-party origin
+        // and makes no network request. Third-party origins remain forbidden.
+        if (hit.startsWith('https://naibul.com')) continue;
         offenders.push(`${rel(file)}: ${hit}`);
       }
     }

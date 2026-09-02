@@ -14,7 +14,7 @@ whatever model or search you actually want to play with.
 ## Running it
 
 ```bash
-mkdir my-ludus-agent && cd my-ludus-agent
+mkdir my-naibul-agent && cd my-naibul-agent
 npm init -y
 npm i @noble/curves
 # save the code below as agent.ts
@@ -25,7 +25,7 @@ No build step, no bundler. `@noble/curves` pulls in `@noble/hashes` as a
 transitive dependency, which is all the code below needs beyond
 `@noble/curves` itself and the platform `fetch`.
 
-Set `LUDUS_BASE_URL` to point at a real deployment; it defaults to a
+Set `NAIBUL_BASE_URL` to point at a real deployment; it defaults to a
 local `wrangler dev` server (see `docs/RUNBOOK.md`).
 
 ## The three-step illegal-move and timeout policy (spec §llm_player_protocol)
@@ -57,12 +57,12 @@ import { ed25519 } from '@noble/curves/ed25519';
 import { bytesToHex, hexToBytes, utf8ToBytes } from '@noble/curves/utils';
 import { sha256 } from '@noble/hashes/sha2';
 
-const BASE_URL = process.env.LUDUS_BASE_URL ?? 'http://localhost:8787';
-const HANDLE = process.env.LUDUS_HANDLE ?? `guide-example-${Date.now().toString(36)}`;
+const BASE_URL = process.env.NAIBUL_BASE_URL ?? 'http://localhost:8787';
+const HANDLE = process.env.NAIBUL_HANDLE ?? `guide-example-${Date.now().toString(36)}`;
 // A secret only this client knows; NEVER stored server-side (see docs/API.md
 // #post-apiagents). Reuse across agents you control to link their operator
 // records; a fresh random one (as here) gets you a fresh operator.
-const OPERATOR_TOKEN = process.env.LUDUS_OPERATOR_TOKEN ?? bytesToHex(crypto.getRandomValues(new Uint8Array(16)));
+const OPERATOR_TOKEN = process.env.NAIBUL_OPERATOR_TOKEN ?? bytesToHex(crypto.getRandomValues(new Uint8Array(16)));
 
 // ---------------------------------------------------------------------------
 // Canonical JSON — mirrors src/crypto/canonical.ts exactly. Anything Naibul

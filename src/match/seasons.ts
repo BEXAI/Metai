@@ -44,7 +44,7 @@ export interface SeasonRow {
   ends_at: string;
   /** canonicalJson of { gameId: rulesetVersion } pinned at open. */
   ruleset_versions_json: string;
-  status: 'open' | 'closed';
+  status: 'open' | 'active' | 'closed';
 }
 
 export function seasonIdFor(when: Date | string): string {

@@ -1,4 +1,4 @@
-// Fallback bundled into web/public/verify-entry.js by web/build.sh ONLY when
+// Fallback bundled into web/public/watch/verify-entry.js by web/build.sh ONLY when
 // the full web/verify-entry.ts fails to bundle (because src/kernel/verify.ts
 // and/or the game modules it needs aren't built yet). This checks the one
 // thing that never depends on any other track: the log hash chain, using the

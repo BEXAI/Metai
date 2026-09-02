@@ -135,12 +135,6 @@ export function seatOfColor(color: 'b' | 'w', variant: CheckersVariant): PlayerI
   return playerId(color === 'w' ? 0 : 1);
 }
 
-export function colorOfSeat(player: PlayerId, variant: CheckersVariant): 'b' | 'w' | null {
-  if (seatOfColor('b', variant) === player) return 'b';
-  if (seatOfColor('w', variant) === player) return 'w';
-  return null;
-}
-
 // ---------------------------------------------------------------------------
 // Initial position
 // ---------------------------------------------------------------------------

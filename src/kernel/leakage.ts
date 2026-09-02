@@ -6,9 +6,8 @@
  * information leaked (card names in hand, deck order fragments, ...).
  */
 
-import { canonicalJson } from '../crypto/canonical.ts';
+import { canonicalJson, sha256Hex } from '../crypto/canonical.ts';
 import { createSeedStream } from './seed.ts';
-import { sha256Hex } from '../crypto/canonical.ts';
 import { buildView } from './view.ts';
 import { isRuleError, playerId, type AnyGame, type Json, type PlayerId, type VariantConfig } from './types.ts';
 

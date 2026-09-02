@@ -156,8 +156,8 @@ export function buildPrompt(view: ViewObject, opts?: PromptOptions): BuiltPrompt
   ];
 
   let out = render(view, stages[0]!);
-  for (const stage of stages) {
-    out = render(view, stage);
+  for (let i = 0; i < stages.length; i++) {
+    if (i > 0) out = render(view, stages[i]!);
     if (approxTokenCount(out.system + out.user) <= budget) break;
   }
   return { ...out, approxTokens: approxTokenCount(out.system + out.user) };

@@ -20,16 +20,6 @@ export function renderFallback(container, view) {
   }
 }
 
-/** Wrap renderer bodies: if they throw or decline (return false), fall back safely. */
-export function withFallback(container, view, renderFn) {
-  try {
-    const recognized = renderFn();
-    if (recognized === false) renderFallback(container, view);
-  } catch (err) {
-    renderFallback(container, view);
-  }
-}
-
 export function makeSvg(viewBoxW, viewBoxH, extraClass) {
   return svgEl('svg', {
     class: extraClass ? `board-svg ${extraClass}` : 'board-svg',

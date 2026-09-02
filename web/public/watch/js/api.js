@@ -5,11 +5,10 @@
 // Envelope (src/api/http.ts, T7): every enveloped response is
 //   { ok: true,  data, metadata: { boundary, untrusted_fields? } }
 //   { ok: false, error: { code, message }, metadata, data? }
-// EXCEPT the live /events proxy, which forwards the Durable Object room's
-// response verbatim ({ events, latest_seq }, no envelope) — see
-// src/api/handlers.ts#getGameEvents. getJson() below unwraps the envelope
-// when present and returns the raw body otherwise, so callers never see the
-// difference.
+// The /events JSON is enveloped like every other endpoint; only its SSE
+// stream is raw (see src/api/handlers.ts#getGameEvents). getJson() below
+// unwraps the envelope when present and returns the raw body otherwise, so
+// callers never see the difference.
 
 const JSON_HEADERS = { accept: 'application/json' };
 

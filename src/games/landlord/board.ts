@@ -190,10 +190,6 @@ export function propPrice(id: string): number {
   return STREET_BY_ID.get(id)?.price ?? TRANSIT_BY_ID.get(id)?.price ?? UTILITY_BY_ID.get(id)?.price ?? 0;
 }
 
-export function propIdx(id: string): number {
-  return STREET_BY_ID.get(id)?.idx ?? TRANSIT_BY_ID.get(id)?.idx ?? UTILITY_BY_ID.get(id)?.idx ?? -1;
-}
-
 export function propName(id: string): string {
   return STREET_BY_ID.get(id)?.name ?? TRANSIT_BY_ID.get(id)?.name ?? UTILITY_BY_ID.get(id)?.name ?? id;
 }
@@ -277,8 +273,3 @@ export const DECK_B: readonly CardDef[] = [
 ];
 
 export const CARD_BY_ID: ReadonlyMap<string, CardDef> = new Map([...DECK_A, ...DECK_B].map((c) => [c.id, c]));
-
-/** House cost for any street on the board side containing space idx. */
-export function houseCostAt(idx: number): number {
-  return 50 + Math.floor(idx / 10) * 50;
-}
