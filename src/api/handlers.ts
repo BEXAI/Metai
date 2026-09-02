@@ -24,6 +24,7 @@ import { disableDoorbell, registerDoorbell, verifyDoorbell } from '../identity/d
 import type { ApiEnv, RoomStub, SqlRow } from './env.ts';
 import { asString, err, isRecord, ok, type ApiResult } from './http.ts';
 import { checkJoinQuota, spendJoin } from './quota.ts';
+import { buildHowto } from '../games/howto.ts';
 import { cronTick } from '../match/pairing.ts';
 
 // ---------------------------------------------------------------------------
@@ -193,6 +194,8 @@ const getCatalog: Handler = async (env, _req) => {
       notation: g.meta.notation,
       board_text: g.meta.boardText,
       rules: `/api/rules/${g.meta.id}`,
+      // How to actually play it: move grammar, phases, traps, worked example.
+      how_to_play: `/api/howto/${g.meta.id}`,
     }));
   return ok({ count: games.length, games });
 };
@@ -508,7 +511,19 @@ const getRules: Handler = async (env, req) => {
     board_text: meta.boardText,
     listed: meta.listed,
     rules_card: card,
+    // How to actually PLAY it (move grammar, phases, traps, worked example
+    // generated from the live engine). MCP clients reach this through the
+    // frozen `rules` tool; HTTP clients can also GET /api/howto/:game.
+    how_to_play: buildHowto(game) as unknown as Json,
   });
+};
+
+/** GET /api/howto/:game — the per-game agent operating manual. */
+const getHowto: Handler = async (env, req) => {
+  const id = req.params.game ?? '';
+  const game = env.games[id];
+  if (!game) return err(404, 'GAME_UNKNOWN', `No game '${id}'. GET /api/catalog for the list.`);
+  return ok(buildHowto(game) as unknown as Json);
 };
 
 const getDocket: Handler = async (env, _req) => {
@@ -535,19 +550,57 @@ const getCheckpoint: Handler = async (env, _req) => {
   return ok({ checkpoint: row as unknown as Json });
 };
 
-const getPulse: Handler = async (env, req) => {
+/**
+ * Board-wide pulse counters are identical for every caller, so they are cached
+ * in KV for PULSE_STATS_TTL seconds instead of being recomputed on every poll.
+ * This matters for cost: agents poll /api/pulse every ~15s, and the ended-games
+ * count grows without bound, so uncached it is O(all games ever) rows read per
+ * poll per agent. The per-agent `waiting_on_you` half below is never cached.
+ */
+const PULSE_STATS_KEY = 'pulse:stats';
+const PULSE_STATS_TTL = 15;
+
+interface PulseStats {
+  live_games: number;
+  ended_games: number;
+  lobby_waiting: number;
+  checkpoint: Json;
+}
+
+async function pulseStats(env: ApiEnv): Promise<PulseStats> {
+  try {
+    const cached = await env.CACHE.get(PULSE_STATS_KEY);
+    if (cached) return JSON.parse(cached) as PulseStats;
+  } catch {
+    /* cache miss or unavailable: fall through and recompute */
+  }
   const live = await env.DB.prepare("SELECT COUNT(*) AS n FROM games WHERE status = 'live'").first<{ n: number }>();
   const ended = await env.DB.prepare("SELECT COUNT(*) AS n FROM games WHERE status = 'ended'").first<{ n: number }>();
   const lobby = await env.DB.prepare('SELECT COUNT(*) AS n FROM lobby').first<{ n: number }>();
   const checkpoint = await env.DB
     .prepare('SELECT tree_size, root, created_at FROM checkpoints ORDER BY id DESC LIMIT 1')
     .first<SqlRow>();
-
-  const data: { [k: string]: Json } = {
+  const stats: PulseStats = {
     live_games: live ? Number(live.n) : 0,
     ended_games: ended ? Number(ended.n) : 0,
     lobby_waiting: lobby ? Number(lobby.n) : 0,
     checkpoint: (checkpoint as unknown as Json) ?? null,
+  };
+  try {
+    await env.CACHE.put(PULSE_STATS_KEY, JSON.stringify(stats), { expirationTtl: PULSE_STATS_TTL });
+  } catch {
+    /* best effort */
+  }
+  return stats;
+}
+
+const getPulse: Handler = async (env, req) => {
+  const stats = await pulseStats(env);
+  const data: { [k: string]: Json } = {
+    live_games: stats.live_games,
+    ended_games: stats.ended_games,
+    lobby_waiting: stats.lobby_waiting,
+    checkpoint: stats.checkpoint,
     time_utc: new Date(env.now()).toISOString(),
   };
 
@@ -886,6 +939,7 @@ export const HANDLERS: Record<string, Handler> = {
   'GET /api/agents/:handle': getAgentProfile,
   'GET /api/leaderboards': getLeaderboards,
   'GET /api/rules/:game': getRules,
+  'GET /api/howto/:game': getHowto,
   'GET /api/docket': getDocket,
   'GET /api/checkpoint': getCheckpoint,
   'GET /api/official': getOfficial,
