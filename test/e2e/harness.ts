@@ -42,11 +42,7 @@ export interface Harness {
   proc: ChildProcess;
   /** Fire the 5-minute cron once via wrangler's --test-scheduled door. */
   tickCron(): Promise<void>;
-  /** Run the pairing+finalize sweep synchronously via the shim door. */
-  sweep(): Promise<unknown>;
-  /** POST /e2e/config. */
-  configure(cfg: unknown): Promise<void>;
-  /** Direct lobby INSERT (unlisted games). */
+  /** Direct lobby INSERT (spec-unlisted games only — tictactoe). */
   seedLobby(row: { game: string; variant?: string; division?: string; agent_id: string }): Promise<void>;
   stop(): Promise<void>;
 }
@@ -165,23 +161,6 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     await sleep(250);
   };
 
-  const sweep = async (): Promise<unknown> => {
-    const res = await fetch(`${base}/e2e/sweep`, { method: 'POST' });
-    const body = (await res.json()) as { ok: boolean; report?: unknown; error?: string };
-    if (!body.ok) throw new Error(`e2e sweep failed: ${body.error}`);
-    return body.report;
-  };
-
-  const configure = async (cfg: unknown): Promise<void> => {
-    const res = await fetch(`${base}/e2e/config`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(cfg),
-    });
-    if (!res.ok) throw new Error(`e2e config failed: HTTP ${res.status}`);
-    await res.body?.cancel();
-  };
-
   const seedLobby = async (row: { game: string; variant?: string; division?: string; agent_id: string }): Promise<void> => {
     const res = await fetch(`${base}/e2e/lobby`, {
       method: 'POST',
@@ -192,5 +171,5 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     await res.body?.cancel();
   };
 
-  return { base, runId, stateDir, logFile, proc, tickCron, sweep, configure, seedLobby, stop };
+  return { base, runId, stateDir, logFile, proc, tickCron, seedLobby, stop };
 }

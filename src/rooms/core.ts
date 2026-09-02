@@ -19,6 +19,10 @@
  *    attempt of a turn caused a seeded random legal move (purpose
  *    `illegal:turn:N`); `submission` is then the rejected third submission
  *    and `notation` is the move actually applied.
+ *  - 'move' and 'timeout' payloads carry `events` — the game module's
+ *    apply() GameEvents (with visibility) — when apply emitted any. Public
+ *    ones are also emitted live to spectators as `game:<type>` events;
+ *    private ones exist only in the log (revealed with the replay).
  *  - 'resign' / 'draw_offer' / 'draw_accept' payloads carry the full signed
  *    `submission` in addition to { turn_index, player } so the Ed25519
  *    signature (over the frozen move message) is verifiable offline.
@@ -45,6 +49,7 @@ import {
   isParseError,
   isRuleError,
   type AnyGame,
+  type GameEvent,
   type GameResult,
   type HistoryEntry,
   type Json,
@@ -71,6 +76,13 @@ function iso(nowMs: number): string {
 }
 
 const MAX_COMMENTARY = 280;
+
+/**
+ * How many recent turns of per-seat private views the room retains (memory,
+ * DO storage, and the finalize-time D1 private_views insert). Older turns are
+ * pruned so the room state stays bounded on arbitrarily long games.
+ */
+export const PV_RETAIN_TURNS = 8;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -178,10 +190,17 @@ export interface RoomSnapshot {
   result: GameResult | null;
   history: HistoryEntry[];
   events: SpectatorEvent[];
-  privateViews: Record<PlayerId, Json>;
+  /**
+   * Per-turn private views (game.privateView per seat), pruned to the last
+   * PV_RETAIN_TURNS turns so the snapshot stays bounded. Keys are String(turn).
+   * Bookkeeping for the D1 private_views table at finalize — never served live
+   * to anyone but the owning seat.
+   */
+  privateViewsByTurn: Record<string, Record<PlayerId, Json>>;
   seedDraws: SeedDraw[];
   rulesCard: string;
-  replay: ReplayFile | null;
+  /** True once the GameRoom has durably finalized this game into D1/R2. */
+  finalized: boolean;
   rejections: RejectionRecord[];
 }
 
@@ -304,12 +323,12 @@ export class RoomCore {
       result: null,
       history: [],
       events: [],
-      privateViews: {},
+      privateViewsByTurn: {},
       seedDraws: [],
       rulesCard:
         params.rulesCard ??
         `${game.meta.name}. Notation: ${game.meta.notation}. Board: ${game.meta.boardText}. Answer with a legal move by notation or { "index": n } into legal_moves.`,
-      replay: null,
+      finalized: false,
       rejections: [],
     };
 
@@ -368,6 +387,20 @@ export class RoomCore {
     if ((snapshot.clocks as Partial<RoomClocks>).perSideMs === undefined) {
       snapshot.clocks.perSideMs = DEFAULT_PER_SIDE_MS[game.meta.id] ?? null;
     }
+    // Snapshots persisted before chunked persistence carry a flat
+    // `privateViews` map, a materialized `replay`, and no `finalized` flag —
+    // normalize them (the replay is re-assembled on demand from the log).
+    const legacy = snapshot as Partial<RoomSnapshot> & {
+      privateViews?: Record<PlayerId, Json>;
+      replay?: unknown;
+    };
+    if (legacy.privateViewsByTurn === undefined) {
+      snapshot.privateViewsByTurn =
+        legacy.privateViews !== undefined ? { [String(snapshot.turnIndex)]: legacy.privateViews } : {};
+      delete legacy.privateViews;
+    }
+    if (legacy.finalized === undefined) snapshot.finalized = false;
+    if (legacy.replay !== undefined) delete legacy.replay;
     const seed = createSeedStream(snapshot.final_seed);
     // Fast-forward the stream by replaying every recorded draw; any mismatch
     // means the snapshot was tampered with or the algorithm drifted.
@@ -418,6 +451,15 @@ export class RoomCore {
   get clocks(): RoomClocks {
     return this.snap.clocks;
   }
+  /** True once the room has durably finalized this game into D1/R2. */
+  get finalized(): boolean {
+    return this.snap.finalized;
+  }
+
+  /** Records that D1/R2 finalization completed (persist the core after). */
+  markFinalized(): void {
+    this.snap.finalized = true;
+  }
 
   playersToMoveNow(): PlayerId[] {
     return this.snap.status === 'running' ? this.game.playersToMove(this.snap.state) : [];
@@ -428,8 +470,37 @@ export class RoomCore {
     return this.playersToMoveNow().filter((p) => this.snap.pendingSimultaneous[p] === undefined);
   }
 
+  /**
+   * The full replay, assembled on demand once the game has ended (never
+   * materialized into the snapshot — on long games it would blow the
+   * Durable Object per-value storage limit).
+   */
   replayFile(): ReplayFile | null {
-    return this.snap.replay;
+    if (this.snap.status !== 'ended' || this.snap.result === null) return null;
+    const seats: ReplaySeat[] = this.snap.seats.map((s) => ({
+      player: s.player,
+      agent_id: s.agent_id,
+      handle: s.handle,
+      pubkey_ed25519: s.pubkey_ed25519,
+    }));
+    return {
+      version: 'ludus.replay.v1',
+      game_id: this.snap.game_id,
+      game: this.snap.game,
+      variant: this.snap.variant,
+      division: this.snap.division,
+      ruleset_version: this.snap.ruleset_version,
+      seats,
+      commitment: this.snap.commitment,
+      drand_round: this.snap.drand_round,
+      drand_randomness: this.snap.drand_randomness,
+      reveal_secret: this.snap.secret,
+      final_seed: this.snap.final_seed,
+      initial_state: this.snap.initial_state,
+      log: this.snap.log,
+      result: this.snap.result,
+      seed_draws: this.seed.draws().slice(),
+    };
   }
 
   /** Spectator events with seq strictly greater than `after` (public only). */
@@ -507,10 +578,35 @@ export class RoomCore {
     return ev;
   }
 
+  /**
+   * Records every seat's private view of the CURRENT state under the current
+   * turn index, pruning turns older than PV_RETAIN_TURNS so the map (and its
+   * persisted form) stays bounded on arbitrarily long games.
+   */
   private refreshPrivateViews(): void {
+    const turn = this.snap.turnIndex;
     const views: Record<PlayerId, Json> = {};
     for (const s of this.snap.seats) views[s.player] = this.game.privateView(this.snap.state, s.player);
-    this.snap.privateViews = views;
+    this.snap.privateViewsByTurn[String(turn)] = views;
+    const floor = turn - PV_RETAIN_TURNS + 1;
+    if (floor > 0) {
+      for (const key of Object.keys(this.snap.privateViewsByTurn)) {
+        if (Number(key) < floor) delete this.snap.privateViewsByTurn[key];
+      }
+    }
+  }
+
+  /**
+   * Emits the game module's apply() events to the spectator feed — PUBLIC
+   * visibility only (spec §game_kernel_contract: events feed "the log and the
+   * spectator feed"; spec §identity_and_integrity.spectator_reveal: private
+   * data appears only in the replay after the game ends).
+   */
+  private emitGameEvents(nowMs: number, turn: number, player: PlayerId, events: GameEvent[]): void {
+    for (const ev of events) {
+      if (ev.visibility !== 'public') continue;
+      this.emit(nowMs, `game:${ev.type}`, { turn_index: turn, player, data: ev.data });
+    }
   }
 
   /** Reads status fresh (mutating helpers may have ended the game mid-call). */
@@ -778,11 +874,11 @@ export class RoomCore {
       forced = true;
       const retried = this.game.apply(this.snap.state, player, move, this.seed);
       if (isRuleError(retried)) throw new Error(`room ${this.snap.game_id}: forced random legal move rejected: ${retried.message}`);
-      this.commitApplied(nowMs, seat, submission, signatureHex, move, retried.state, drawStart, forced);
+      this.commitApplied(nowMs, seat, submission, signatureHex, move, retried.state, drawStart, forced, retried.events);
       return this.okResult(evStart, true, forced, this.snap.history[this.snap.history.length - 1]?.notation);
     }
 
-    this.commitApplied(nowMs, seat, submission, signatureHex, move, applied.state, drawStart, forced);
+    this.commitApplied(nowMs, seat, submission, signatureHex, move, applied.state, drawStart, forced, applied.events);
     return this.okResult(evStart, true, forced, this.snap.history[this.snap.history.length - 1]?.notation);
   }
 
@@ -796,6 +892,7 @@ export class RoomCore {
     newState: Json,
     drawStart: number,
     forced: boolean,
+    gameEvents: GameEvent[],
   ): void {
     const player = seat.player;
     const turn = this.snap.turnIndex;
@@ -817,6 +914,9 @@ export class RoomCore {
       draws: this.drawsDelta(drawStart),
     };
     if (forced) payload['forced'] = 'illegal';
+    // Spec §game_kernel_contract.apply: structured events go to the log (all,
+    // with visibility — the log is revealed only in the post-end replay) …
+    if (gameEvents.length > 0) payload['events'] = gameEvents as unknown as Json;
     this.appendLog(nowMs, 'move', payload, signatureHex);
 
     if (forced) {
@@ -853,6 +953,8 @@ export class RoomCore {
     if (hist.commentary !== undefined) evData['commentary'] = hist.commentary;
     if (forced) evData['forced'] = 'illegal';
     this.emit(nowMs, 'move', evData);
+    // … and the PUBLIC ones to the spectator feed, right after the move event.
+    this.emitGameEvents(nowMs, turn, player, gameEvents);
 
     // Three strikes forfeit BEFORE the terminal check runs (safety net; the
     // submit paths already forfeit third strikes without applying a move): a
@@ -1011,19 +1113,22 @@ export class RoomCore {
 
       const notation = this.game.moveToNotation(move, this.snap.state);
       this.snap.state = applied.state;
+      const gameEvents = applied.events;
       const stateHash = hashState(this.snap.state);
       const draws = this.drawsDelta(drawStart);
 
       if (entryKind === 'timeout') {
         const count = (this.snap.strikes[player] ?? 0) + 1;
-        this.appendLog(nowMs, 'timeout', {
+        const payload: Record<string, Json> = {
           turn_index: turn,
           player,
           applied_notation: notation,
           state_hash: stateHash,
           draws,
           strike_count: count,
-        }, null);
+        };
+        if (gameEvents.length > 0) payload['events'] = gameEvents as unknown as Json;
+        this.appendLog(nowMs, 'timeout', payload, null);
       } else {
         const payload: Record<string, Json> = {
           turn_index: turn,
@@ -1035,6 +1140,7 @@ export class RoomCore {
           draws,
         };
         if (h.forced === 'illegal' || strikeReason === 'illegal_move') payload['forced'] = 'illegal';
+        if (gameEvents.length > 0) payload['events'] = gameEvents as unknown as Json;
         this.appendLog(nowMs, 'move', payload, h.signature);
       }
 
@@ -1057,6 +1163,7 @@ export class RoomCore {
       if (hist.commentary !== undefined) evData['commentary'] = hist.commentary;
       if (h.forced !== null) evData['forced'] = h.forced;
       this.emit(nowMs, entryKind === 'timeout' ? 'timeout' : 'move', evData);
+      this.emitGameEvents(nowMs, turn, player, gameEvents);
 
       if (strikeReason !== null) {
         this.recordStrike(nowMs, player, strikeReason, turn);
@@ -1173,17 +1280,20 @@ export class RoomCore {
 
     const notation = this.game.moveToNotation(move, this.snap.state);
     this.snap.state = applied.state;
+    const gameEvents = applied.events;
     const stateHash = hashState(this.snap.state);
 
     const count = (this.snap.strikes[player] ?? 0) + 1;
-    this.appendLog(nowMs, 'timeout', {
+    const timeoutPayload: Record<string, Json> = {
       turn_index: turn,
       player,
       applied_notation: notation,
       state_hash: stateHash,
       draws: this.drawsDelta(drawStart),
       strike_count: count,
-    }, null);
+    };
+    if (gameEvents.length > 0) timeoutPayload['events'] = gameEvents as unknown as Json;
+    this.appendLog(nowMs, 'timeout', timeoutPayload, null);
 
     this.snap.history.push({ turnIndex: turn, player, notation });
     this.refreshPrivateViews();
@@ -1196,6 +1306,7 @@ export class RoomCore {
       public: this.game.publicView(this.snap.state),
       board_text: this.game.renderText(this.snap.state, null),
     });
+    this.emitGameEvents(nowMs, turn, player, gameEvents);
     this.recordStrike(nowMs, player, 'timeout', turn);
 
     if (this.snap.status === 'running') {
@@ -1232,30 +1343,9 @@ export class RoomCore {
       drand_randomness: this.snap.drand_randomness,
     }, null);
 
-    const seats: ReplaySeat[] = this.snap.seats.map((s) => ({
-      player: s.player,
-      agent_id: s.agent_id,
-      handle: s.handle,
-      pubkey_ed25519: s.pubkey_ed25519,
-    }));
-    this.snap.replay = {
-      version: 'ludus.replay.v1',
-      game_id: this.snap.game_id,
-      game: this.snap.game,
-      variant: this.snap.variant,
-      division: this.snap.division,
-      ruleset_version: this.snap.ruleset_version,
-      seats,
-      commitment: this.snap.commitment,
-      drand_round: this.snap.drand_round,
-      drand_randomness: this.snap.drand_randomness,
-      reveal_secret: this.snap.secret,
-      final_seed: this.snap.final_seed,
-      initial_state: this.snap.initial_state,
-      log: this.snap.log,
-      result,
-      seed_draws: this.seed.draws().slice(),
-    };
+    // The replay file is assembled on demand by replayFile() — never stored
+    // in the snapshot (it duplicates the whole log and would overflow the
+    // Durable Object per-value storage limit on long games).
 
     // Public 'end' first; the reveal follows only after the game has ended
     // (spec §identity_and_integrity.spectator_reveal).

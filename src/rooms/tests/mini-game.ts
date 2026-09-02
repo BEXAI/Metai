@@ -18,6 +18,7 @@
 import {
   playerId,
   type AnyGame,
+  type GameEvent,
   type GameMeta,
   type GameResult,
   type Json,
@@ -121,10 +122,19 @@ function makeGame(withDefault: boolean): AnyGame {
         simulDone: simulActive(s) ? { ...s.simulDone, [player]: true } : s.simulDone,
         lastRoll: roll,
       };
-      return {
-        state: next as Json,
-        events: [{ type: 'played', data: { player, m, roll }, visibility: 'public' as const }],
-      };
+      const events: GameEvent[] = [
+        { type: 'played', data: { player, m, roll }, visibility: 'public' },
+        // Private-event probe (gate A10): carries the mover's secret token.
+        // It must reach the log (replay, post-end) but NEVER the live
+        // spectator feed.
+        {
+          type: 'peek',
+          data: { player, secret: s.hidden[player] ?? null },
+          visibility: 'private',
+          to: [player],
+        },
+      ];
+      return { state: next as Json, events };
     },
 
     isTerminal(state): GameResult | null {

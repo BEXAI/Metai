@@ -153,6 +153,40 @@ describe('standingsFromResult', () => {
     const standings = standingsFromResult(['x', 'y'], { winners: [], draw: true, reason: 'stalemate' });
     expect(standings.map((s) => s.position)).toEqual([1, 1]);
   });
+
+  it('a decisive result with all-equal scores ranks the winner first (forfeit signature)', () => {
+    // Regression (e2e-pinned bug): chinese_checkers anti-stall forfeit ends
+    // with winners=['p1'] and scores all zero; score-only ranking rated it as
+    // a Glicko-2 draw. Winners must outrank non-winners regardless of score.
+    const standings = standingsFromResult(['x', 'y'], {
+      winners: ['p1'],
+      draw: false,
+      reason: 'forfeit',
+      scores: { p0: 0, p1: 0 },
+    });
+    expect(standings).toEqual([
+      { agent_id: 'x', position: 2 },
+      { agent_id: 'y', position: 1 },
+    ]);
+    // Six players, flat scores, one forfeit winner: winner 1, everyone else tied 2.
+    const six = standingsFromResult(['a', 'b', 'c', 'd', 'e', 'f'], {
+      winners: ['p5'],
+      draw: false,
+      reason: 'forfeit',
+      scores: { p0: 0, p1: 0, p2: 0, p3: 0, p4: 0, p5: 0 },
+    });
+    expect(six.map((s) => s.position)).toEqual([2, 2, 2, 2, 2, 1]);
+  });
+
+  it('a drawn result with scores still ranks purely by score', () => {
+    const standings = standingsFromResult(['x', 'y', 'z'], {
+      winners: ['p0', 'p2'],
+      draw: true,
+      reason: 'turn_limit',
+      scores: { p0: 7, p1: 5, p2: 7 },
+    });
+    expect(standings.map((s) => s.position)).toEqual([1, 3, 1]);
+  });
 });
 
 describe('decomposition + rate consistency', () => {

@@ -1,9 +1,9 @@
 {
   // E2E wrangler config: identical bindings to the root wrangler.jsonc, but
-  // main points at the e2e shim worker (test/e2e/worker.ts), which wraps the
-  // REAL src/index.ts Worker and adds ONLY the integration glue that is not
-  // wired in this build (pairing sweep, end-of-game D1 persistence, ratings)
-  // plus a couple of test-only doors under /e2e/*. See notes/e2e-driver.md.
+  // main points at the e2e shim worker (test/e2e/worker.ts) — a THIN
+  // pass-through of the REAL src/index.ts Worker (pairing, finalization, and
+  // ratings are all product paths now) plus test-only doors under /e2e/*
+  // (ping, unlisted-lobby seed, rate-limit reset). See notes/e2e-driver.md.
   //
   // Paths are relative to this file's directory.
   "$schema": "../../node_modules/wrangler/config-schema.json",

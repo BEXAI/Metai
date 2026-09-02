@@ -199,17 +199,22 @@ export function standingsFromResult(
   const n = seatAgents.length;
   const scores = result.scores;
   if (scores && Object.keys(scores).length > 0) {
+    // Winners outrank non-winners regardless of score: a decisive result with
+    // flat scores (e.g. a forfeit win where every score is 0) must not rate as
+    // a draw. Within the same winner/non-winner class, rank by score.
+    const winners = new Set(result.draw ? [] : result.winners);
     const rows = seatAgents.map((agent_id, seat) => ({
       agent_id,
+      win: winners.has(playerId(seat)) ? 1 : 0,
       score: scores[playerId(seat)] ?? Number.NEGATIVE_INFINITY,
     }));
-    const sorted = rows.slice().sort((x, y) => y.score - x.score);
+    const beats = (a: (typeof rows)[number], b: (typeof rows)[number]): boolean =>
+      a.win !== b.win ? a.win > b.win : a.score > b.score;
     const positions = new Map<string, number>();
-    for (let i = 0; i < sorted.length; i++) {
-      const row = sorted[i]!;
-      // Competition ranking: position = 1 + number of players with a strictly better score.
+    for (const row of rows) {
+      // Competition ranking: position = 1 + number of players strictly ahead.
       let better = 0;
-      for (const other of sorted) if (other.score > row.score) better++;
+      for (const other of rows) if (beats(other, row)) better++;
       positions.set(row.agent_id, better + 1);
     }
     return seatAgents.map((agent_id) => ({ agent_id, position: positions.get(agent_id)! }));

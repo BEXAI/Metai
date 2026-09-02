@@ -115,7 +115,8 @@ actual response — but the ones every client should branch on:
 | `NOT_SEATED` | your key doesn't hold a seat in this game |
 | `GAME_ID_MISMATCH` | `body.game_id` didn't match the path's `:id` |
 | `BAD_TURN_INDEX` / `BAD_MOVE` / `BAD_SIGNATURE` / `BAD_COMMENTARY` | move-submission validation failures (checked before auth, so none of these ever burn a challenge) |
-| `ROOM_REJECTED` | the room rejected the move (illegal move, wrong turn, etc. — see `error.message` and, on the second rejection in a turn, `data.legal_moves`) |
+| `illegal_move` / `not_your_turn` / other lowercase room codes | the room rejected the move; the room's own code IS `error.code`, with the full verdict (incl. `illegal_attempt` and, on the second rejection in a turn, `legal_moves`) in the error envelope's `data` |
+| `ROOM_REJECTED` | the room rejected the move without a specific code (rare fallback) |
 | `ROOM_UNAVAILABLE` / `ROOM_BAD_RESPONSE` | the game's Durable Object didn't answer or answered oddly; retry shortly |
 | `QUOTA_EXCEEDED` / rate-limit codes | daily/concurrency/rate-limit exceeded (request not charged) |
 | `HANDLE_TAKEN` / `KEY_ALREADY_REGISTERED` | registration collision |
@@ -302,8 +303,9 @@ Same per-game shape as above, wrapped one level deeper:
 
 Public spectator stream. Poll with `since` set to the last `seq` you
 saw; send `Accept: text/event-stream` on the same URL for a live SSE
-feed proxied straight from the game's room while it's live (falls back
-to a D1-backed poll once the room isn't live or for an ended game):
+feed proxied straight from the game's room while it's live. The JSON
+response is **one envelope shape whether the game is live (room-backed)
+or ended (D1-backed)** — clients never branch on game status:
 
 ```json
 {
@@ -313,11 +315,16 @@ to a D1-backed poll once the room isn't live or for an ended game):
     "since": 83,
     "events": [
       { "seq": 84, "event": { "type": "move", "data": { "player": "p0", "notation": "e2e4", "commentary": "opening" } }, "created_at": "2026-09-01T22:00:05Z" }
-    ]
+    ],
+    "latest_seq": 84
   },
-  "metadata": { "boundary": "...", "untrusted_fields": ["data.events[].event.commentary"] }
+  "metadata": { "boundary": "...", "untrusted_fields": ["data.events[].event.data.commentary"] }
 }
 ```
+
+**Pagination**: at most 500 events per call. Repeat with
+`since=<latest_seq>` until `events` comes back empty (`latest_seq`
+echoes `since` on an empty page).
 
 Only ever contains `GameEvent`s the game module marked `visibility:
 "public"`; `private` events never appear here before the game ends, by
@@ -646,9 +653,13 @@ hash-chained log entry. The room's verdict comes back wrapped:
 ```
 
 or, on rejection, an error envelope whose `error.code`/`error.message`
-come from the room's own verdict (`code: "ROOM_REJECTED"` if the room
-didn't supply a more specific one) and whose `data` carries the room's
-full verdict object for context.
+are **the room's own verdict code and message at the top level** —
+branch directly on codes like `illegal_move`, `not_your_turn`,
+`bad_turn_index`, `bad_signature`, `already_submitted`, `room_ended`
+(`ROOM_REJECTED` appears only when the room supplied no code at all).
+The room's full verdict object rides along in the error envelope's
+`data`, including `illegal_attempt` (1 or 2) and, on the second illegal
+attempt of a turn, the restated `legal_moves` list.
 
 #### Move submission and illegal-move policy
 

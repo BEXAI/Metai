@@ -13,51 +13,9 @@ import { generateKeypair, signEd25519 } from '../../crypto/ed25519.ts';
 import type { ReplayFile } from '../../kernel/replay.ts';
 import type { Json, MoveSubmission, PlayerId } from '../../kernel/types.ts';
 import { moveSignMessage } from '../core.ts';
-import { GameRoom, setGameResolverForTests, type RoomCtx, type RoomEnv, type RoomStorage } from '../room.ts';
+import { GameRoom, setGameResolverForTests, setRatingsHookForTests, type RoomCtx, type RoomEnv } from '../room.ts';
+import { MockBucket, MockStorage, req } from './helpers.ts';
 import { miniGame, P0, P1, secretProbe } from './mini-game.ts';
-
-// ---------------------------------------------------------------------------
-// Mocks
-// ---------------------------------------------------------------------------
-
-class MockStorage implements RoomStorage {
-  data = new Map<string, unknown>();
-  alarmAt: number | null = null;
-  // eslint-disable-next-line @typescript-eslint/require-await
-  async get<T = unknown>(key: string): Promise<T | undefined> {
-    const v = this.data.get(key);
-    return v === undefined ? undefined : (JSON.parse(JSON.stringify(v)) as T);
-  }
-  // eslint-disable-next-line @typescript-eslint/require-await
-  async put<T>(key: string, value: T): Promise<void> {
-    this.data.set(key, JSON.parse(JSON.stringify(value)));
-  }
-  // eslint-disable-next-line @typescript-eslint/require-await
-  async setAlarm(scheduledTime: number | Date): Promise<void> {
-    this.alarmAt = typeof scheduledTime === 'number' ? scheduledTime : scheduledTime.getTime();
-  }
-  // eslint-disable-next-line @typescript-eslint/require-await
-  async deleteAlarm(): Promise<void> {
-    this.alarmAt = null;
-  }
-}
-
-class MockBucket {
-  puts: { key: string; value: string }[] = [];
-  // eslint-disable-next-line @typescript-eslint/require-await
-  async put(key: string, value: string): Promise<unknown> {
-    this.puts.push({ key, value });
-    return null;
-  }
-}
-
-function req(path: string, body?: unknown, method?: string): Request {
-  return new Request(`http://room${path}`, {
-    method: method ?? (body === undefined ? 'GET' : 'POST'),
-    headers: { 'content-type': 'application/json' },
-    body: body === undefined ? null : JSON.stringify(body),
-  });
-}
 
 const keypairs = [generateKeypair(), generateKeypair()];
 const seats = [P0, P1].map((player, i) => ({
@@ -94,9 +52,12 @@ const createBody = {
 
 beforeAll(() => {
   setGameResolverForTests((id) => (id === 'mini' ? miniGame : undefined));
+  // These tests exercise the DO shell, not the Glicko-2 layer.
+  setRatingsHookForTests(async () => {});
 });
 afterAll(() => {
   setGameResolverForTests(null);
+  setRatingsHookForTests(null);
 });
 
 describe('GameRoom Durable Object', () => {
@@ -159,11 +120,12 @@ describe('GameRoom Durable Object', () => {
     expect(verifyChain(GAME_ID, replay.log).ok).toBe(true);
     expect(replay.result.winners).toEqual([P0]);
 
-    // Ended: view returns 409, alarm cleared, replay uploaded to R2 exactly once.
+    // Ended: view returns 409, alarm cleared, replay uploaded to R2 exactly
+    // once — under the API's canonical 'replays/<game_id>.json' key.
     expect((await room.fetch(req('/view/p0'))).status).toBe(409);
     expect(storage.alarmAt).toBeNull();
     expect(bucket.puts).toHaveLength(1);
-    expect(bucket.puts[0]!.key).toBe(`${GAME_ID}.json`);
+    expect(bucket.puts[0]!.key).toBe(`replays/${GAME_ID}.json`);
     expect((JSON.parse(bucket.puts[0]!.value) as ReplayFile).game_id).toBe(GAME_ID);
 
     // Spectator events (JSON): public only — no probe string before the end.

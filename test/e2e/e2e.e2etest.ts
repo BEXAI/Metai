@@ -59,10 +59,22 @@ afterAll(async () => {
 async function assertMatch(report: MatchReport): Promise<void> {
   const replay = report.replay;
 
+  // The game was created by the REAL cronTick pairer (d1GameFactory ids are
+  // game_<16 hex>; the retired shim factory used game_e2e_<...>).
+  expect(report.gameId).toMatch(/^game_[0-9a-f]{16}$/);
+
   // Commitment was public (and the reveal sealed) before the first move.
   expect(report.preMatchGame.status).toBe('live');
   expect(report.preMatchGame.commitment).toMatch(/^[0-9a-f]{64}$/);
   expect(report.preMatchGame.reveal_secret).toBeNull();
+
+  // The replay must be the FULL R2 blob the room uploaded at finalize, not
+  // the reduced D1 reconstruction (which is marked reconstructed_from:'d1'
+  // and has empty seed_draws / null initial_state).
+  expect(
+    (replay as unknown as { reconstructed_from?: string }).reconstructed_from,
+    'replay must be served from R2, not reconstructed from D1',
+  ).toBeUndefined();
 
   // Log ordering: exactly one commitment/start/end/reveal; commitment before
   // the first applied move; end second-to-last; reveal last.
@@ -110,14 +122,47 @@ async function assertMatch(report: MatchReport): Promise<void> {
     }
   }
 
-  // Ratings: every seat shows up on the leaderboard with a played game.
+  // Ratings: every seat shows up on the leaderboard with a played game, and
+  // the REAL Glicko-2 application moved decisive games off 1500-flat
+  // (winner up, at least one loser down). Draws legitimately stay at 1500
+  // (only RD shrinks), so the inequality applies to decisive results only.
   const anon = new LudusClient({ base: h.base, handle: 'e2e-reader', ip: '10.99.0.1' });
   const lb = await anon.leaderboard(`?game=${report.game}`);
+  const ratingOf = new Map<string, { rating: number; games_played: number }>();
   for (const agent of report.agents) {
     const row = lb.leaderboard.find((r) => r.handle === agent.handle);
     expect(row, `${agent.handle} missing from the ${report.game} leaderboard`).toBeTruthy();
     expect(row!.games_played).toBeGreaterThanOrEqual(1);
     expect(row!.rating).toBeGreaterThan(0);
+    ratingOf.set(agent.handle, { rating: row!.rating, games_played: row!.games_played });
+  }
+  const result = replay.result as { winners?: string[]; draw?: boolean; scores?: Record<string, number> } | null;
+  // Every decisive result must move ratings — including decisive results with
+  // all-equal scores (chinese_checkers' anti-stalling forfeit: winners=[p1],
+  // scores={p0:0,p1:0}), which standingsFromResult once rated as a draw
+  // (fixed: winners now outrank non-winners regardless of score).
+  if (
+    result &&
+    Array.isArray(result.winners) &&
+    result.winners.length > 0 &&
+    result.winners.length < replay.seats.length && // an all-winners tie rates like a draw
+    result.draw !== true
+  ) {
+    const handleOf = new Map((replay.seats as { player: string; handle: string }[]).map((s) => [s.player, s.handle]));
+    const winnerHandles = new Set(result.winners.map((p) => handleOf.get(p)).filter((x): x is string => !!x));
+    for (const agent of report.agents) {
+      const r = ratingOf.get(agent.handle)!;
+      if (winnerHandles.has(agent.handle)) {
+        expect(r.rating, `winner ${agent.handle} must be rated above the 1500 default`).toBeGreaterThan(1500.5);
+      }
+    }
+    const losers = report.agents.filter((a) => !winnerHandles.has(a.handle));
+    if (losers.length > 0) {
+      expect(
+        losers.some((a) => ratingOf.get(a.handle)!.rating < 1499.5),
+        'at least one non-winner must be rated below the 1500 default',
+      ).toBe(true);
+    }
   }
 }
 
@@ -169,26 +214,30 @@ describe('stage-4 e2e: full matches for every M1+M2 game (2 players)', () => {
   }
 });
 
-describe('stage-4 e2e: 3-player hidden-information trading games', () => {
+describe('stage-4 e2e: hidden-information trading games', () => {
   it(
-    'landlord: 3-player match with at least one auction; trades/bankruptcy tracked',
+    'landlord: FULL-LENGTH 2-player match crossing the old ~2MB blob limit (chunked DO storage); auction tracked',
     { timeout: 1_800_000 },
     async () => {
       let report: MatchReport | null = null;
       for (let attempt = 0; attempt < 3; attempt++) {
         const r = await runMatch(h, {
           game: 'landlord',
-          players: 3,
+          // The REAL cronTick pairer always seats meta.players.min (=2 for
+          // landlord; a 3-seat game is unreachable through the product path —
+          // see notes/e2e-driver.md). 2 players it is; islanders (min 3)
+          // covers 3-player pairing.
+          players: 2,
           maxDecisions: 4000,
           label: `landlord-${attempt}`,
-          // Published variant values: 75-round limit + 1000 starting cash
-          // (faster rents/bankruptcies). Long trading games overflow the
-          // room's single-blob DO snapshot (SQLITE_TOOBIG — see
-          // notes/e2e-driver.md), so after 620 applied decisions the mover
-          // resigns: a legitimate signed move producing a real result.
-          variant: '{"starting_cash":1000,"turn_limit":75}',
-          resignAfterDecisions: 620,
-          strategies: [landlordStrategy, landlordStrategy, landlordStrategy],
+          // High cash defers bankruptcies so the game runs to the full
+          // 150-round turn limit: ~1200 applied decisions (sizeprobe:
+          // the retired single-blob snapshot would be ~7MB here, 3.5x the
+          // documented 2MB DO per-value cap that used to kill the room at
+          // ~780 decisions). NO resign valve — the room's chunked storage
+          // must survive the whole game.
+          variant: '{"starting_cash":20000,"turn_limit":150}',
+          strategies: [landlordStrategy, landlordStrategy],
           commentaryEvery: 20,
         });
         report = r;
@@ -197,6 +246,10 @@ describe('stage-4 e2e: 3-player hidden-information trading games', () => {
       }
       await assertMatch(report!);
       expect(report!.flags.auction, 'at least one auction must have started').toBe(true);
+      expect(
+        report!.decisions,
+        'the match must cross the old ~800-decision blob-limit point to prove chunked DO storage end-to-end',
+      ).toBeGreaterThanOrEqual(800);
       console.log(`[e2e] landlord flags: ${JSON.stringify(report!.flags)}, decisions=${report!.decisions}`);
       (globalThis as Record<string, unknown>).__landlordFlags = report!.flags;
     },
@@ -214,8 +267,7 @@ describe('stage-4 e2e: 3-player hidden-information trading games', () => {
           maxDecisions: 4000,
           label: `islanders-${attempt}`,
           // Build-priority play reaches 10 VP well before the 100-round
-          // limit; the resign valve is a snapshot-size backstop only.
-          resignAfterDecisions: 620,
+          // limit; no resign valve — chunked DO storage handles full length.
           strategies: [islandersStrategy, islandersStrategy, islandersStrategy],
           commentaryEvery: 20,
         });
@@ -281,30 +333,15 @@ describe('stage-4 e2e: deliberate misbehavior (A11)', () => {
       expect(strikes.some((s) => s.reason === 'illegal_move' && s.player === illegalStriker)).toBe(true);
       for (const s of strikes) expect(s.strike_count).toBeGreaterThanOrEqual(1);
 
-      // Offline verification of the abused game. KNOWN PRODUCT BUG (see
-      // notes/e2e-driver.md gap #9): src/kernel/verify.ts has no branch for
-      // T6's forced-third-illegal 'move' entries (payload.forced==='illegal',
-      // submission = the rejected 3rd attempt) — it resolves submission.move
-      // and fails 'recomputation' with "index ... out of range". Everything
-      // up to that contract mismatch must still verify: structure,
-      // commitment, final seed, hash chain, and every Ed25519 signature.
+      // FULL strict offline verification. The old gap #9 (verifyReplay had
+      // no branch for forced-third-illegal 'move' entries) is fixed:
+      // src/kernel/verify.ts now recomputes payload.forced==='illegal'
+      // entries, so a replay containing a forced move, a timeout default,
+      // and strikes must pass EVERY check.
       const verdict = verifyReplay(report.replay, GAMES);
       const failed = verdict.checks.filter((c) => !c.ok);
-      if (failed.length > 0) {
-        const names = failed.map((c) => c.name).sort();
-        expect(names, `unexpected verifyReplay failures: ${JSON.stringify(failed)}`).toEqual(
-          ['recomputation', 'result', 'seed_draws'], // the known cascade
-        );
-        const recomp = failed.find((c) => c.name === 'recomputation')!;
-        expect(recomp.detail ?? '').toMatch(/out of range/);
-        console.warn(
-          '[e2e] KNOWN BUG tolerated: verifyReplay cannot recompute forced-third-illegal move entries ' +
-            `(room logs them per notes/T6.md, verifier follows notes/T1-kernel.md) — ${recomp.detail}`,
-        );
-      }
-      for (const name of ['structure', 'commitment', 'final_seed', 'hash_chain', 'signatures'] as const) {
-        expect(verdict.checks.find((c) => c.name === name)?.ok, `check '${name}' must pass`).toBe(true);
-      }
+      expect(failed, `verifyReplay failures on the misbehavior replay: ${JSON.stringify(failed)}`).toHaveLength(0);
+      expect(verdict.ok).toBe(true);
     },
   );
 });

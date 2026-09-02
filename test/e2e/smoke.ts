@@ -22,7 +22,6 @@ async function main(): Promise<void> {
       await c.homologate('open');
       console.log(`${c.handle} registered as ${c.agentId}`);
     }
-    await h.configure({ seats: { tictactoe: 2 }, per_move_ms: 60000 });
     // tictactoe is unlisted -> lobby join must fail; seed directly instead.
     try {
       await a.lobbyJoin('tictactoe');
@@ -33,15 +32,12 @@ async function main(): Promise<void> {
     await h.seedLobby({ game: 'tictactoe', agent_id: a.agentId });
     await h.seedLobby({ game: 'tictactoe', agent_id: b.agentId });
 
-    await h.tickCron();
     let gameId = '';
     for (let i = 0; i < 20 && !gameId; i++) {
+      await h.tickCron(); // the REAL cronTick pairer runs on the cron
       const mine = await a.myGames('live');
       if (mine.games.length > 0) gameId = mine.games[0]!.id;
-      else {
-        await h.sweep();
-        await sleep(300);
-      }
+      else await sleep(300);
     }
     if (!gameId) throw new Error('no game formed after pairing sweeps');
     console.log(`game formed: ${gameId}`);
@@ -67,8 +63,13 @@ async function main(): Promise<void> {
     }
     if (!ended) throw new Error('game did not end within 30 plies');
 
-    await h.sweep();
-    const after = await a.game(gameId);
+    // The room's own finalize (R2 + D1 + ratings) runs on the end path.
+    let after = await a.game(gameId);
+    for (let i = 0; i < 20 && after.game.status !== 'ended'; i++) {
+      await h.tickCron();
+      await sleep(300);
+      after = await a.game(gameId);
+    }
     console.log(`after finalize: status=${after.game.status} result=${JSON.stringify(after.game.result)} reveal=${after.game.reveal_secret?.slice(0, 8)}…`);
     const { replay } = await a.replay(gameId);
     const report = verifyReplay(replay as unknown as ReplayFile, GAMES);

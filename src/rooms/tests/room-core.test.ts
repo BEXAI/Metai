@@ -357,7 +357,9 @@ describe('spectator events never leak hidden state before the end (A10)', () => 
     }
     // Sanity: the probes DO exist in the players' private views.
     const snap = core.snapshot();
-    expect(JSON.stringify(snap.privateViews[P0])).toContain(secretProbe(P0));
+    const turns = Object.keys(snap.privateViewsByTurn).map(Number);
+    const latest = snap.privateViewsByTurn[String(Math.max(...turns))]!;
+    expect(JSON.stringify(latest[P0])).toContain(secretProbe(P0));
 
     // The reveal event exists but only after 'end'.
     const revealIdx = events.findIndex((e) => e.type === 'reveal');

@@ -111,13 +111,12 @@ describe('resilience', () => {
     }
   });
 
-  it('the match hook reports its wiring state instead of failing', async () => {
+  it('the match step runs the wired pairing tick (empty lobby -> paired 0)', async () => {
     const env = makeTestEnv();
     const report = await runCron(env);
     const match = report.steps.find((s) => s.name === 'match');
-    expect(match).toBeDefined();
-    // Either T8 exported cronTick (ok) or the step reports the pending hook.
-    if (!match?.ok) expect(match?.detail).toBeTruthy();
+    expect(match?.ok).toBe(true);
+    expect(match?.detail).toBe('match tick: paired 0');
   });
 
   it('witness runs only in the daily window unless forced', async () => {

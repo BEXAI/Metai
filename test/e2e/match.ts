@@ -1,8 +1,9 @@
 /**
  * Match driver: N LudusClients play one REAL game end-to-end through the live
- * local Worker — register, homologate, enter the lobby, wait for the pairer
- * (cron tick), then move whenever the room says it's their turn, until the
- * game ends; finally the finalize sweep runs and the replay is fetched.
+ * local Worker — register, homologate, enter the lobby, wait for the REAL
+ * cronTick pairer (cron tick), then move whenever the room says it's their
+ * turn, until the game ends; the room's own finalize path (R2 + D1 + ratings)
+ * runs on end and the replay is fetched from the API.
  *
  * Strategies are pluggable:
  *   - randomStrategy: seeded uniform pick over legal_moves (deterministic per
@@ -182,17 +183,26 @@ export async function fetchEvents(base: string, gameId: string, since = 0): Prom
 }
 
 /**
- * Target-event detection. The room's spectator stream carries only room-level
- * 'move' events (the game modules' own GameEvents — auction_start, trade,
- * stolen, bankruptcy — are dropped by the room; see notes/e2e-driver.md), so
- * the flags are derived from the PUBLIC move notations and the public phase:
- *   - auction:    an auction_bid(...) notation, or the public phase 'auction'
- *   - trade:      an applied accept(id) notation (landlord and islanders)
- *   - steal:      move_bandit(hex,victim)/warrior with a real victim (not '-')
- *   - bankruptcy: an applied declare_bankruptcy notation
+ * Target-event detection. Since the stage-4 integration, the room emits the
+ * game modules' own PUBLIC GameEvents live to spectators as `game:<type>`
+ * events (auction_start, auction_won, trade, stolen, bankruptcy, ...), so the
+ * flags key off those first; the pre-integration notation/phase heuristics
+ * are kept as a cross-check fallback:
+ *   - auction:    game:auction_start, an auction_bid(...) notation, or the
+ *                 public phase 'auction'
+ *   - auctionWon: game:auction_won
+ *   - trade:      game:trade, or an applied accept(id) notation
+ *   - steal:      game:stolen, or move_bandit/warrior with a real victim
+ *   - bankruptcy: game:bankruptcy, or an applied declare_bankruptcy notation
  */
 export function updateFlags(flags: MatchFlags, events: readonly NormalizedEvent[]): void {
   for (const e of events) {
+    // Real game-authored events (wired by the stage-4 rooms integration).
+    if (e.type === 'game:auction_start') flags.auction = true;
+    if (e.type === 'game:auction_won') flags.auctionWon = true;
+    if (e.type === 'game:trade') flags.trade = true;
+    if (e.type === 'game:stolen') flags.steal = true;
+    if (e.type === 'game:bankruptcy') flags.bankruptcy = true;
     if (e.type !== 'move' || !e.data || typeof e.data !== 'object' || Array.isArray(e.data)) continue;
     const data = e.data as { notation?: string; public?: { phase?: string } };
     const n = data.notation ?? '';
@@ -221,15 +231,14 @@ export interface MatchOptions {
   transports?: Transport[];
   variant?: string;
   division?: 'pure' | 'open';
-  perMoveMs?: number;
   /** Safety cap on total applied decisions before the driver gives up. */
   maxDecisions?: number;
   /**
    * Legitimate early end: once this many decisions have been applied, the
    * next player to move RESIGNS (a signed move; the room ends the game with a
-   * real 'resignation' result). Needed for the trading games, whose natural
-   * turn-limit length overflows the room's single-blob DO snapshot (product
-   * bug, see notes/e2e-driver.md).
+   * real 'resignation' result). No longer needed for the trading games (the
+   * room's chunked DO storage survives full-length matches now) — kept as a
+   * generic driver capability.
    */
   resignAfterDecisions?: number;
   /** Distinguishes retries; feeds handles + strategy seeds. */
@@ -261,6 +270,30 @@ export interface MatchReport {
   replayPath: string;
 }
 
+/**
+ * Wait for the PRODUCT finalize path (GameRoom.finalize: R2 upload + D1 rows
+ * + ratings hook, run on every end path inside the room) to flip the games
+ * row to 'ended'. Normally instant — finalize is awaited before the ending
+ * move's response — but D1 failures are retried by the room's alarm (+5 s),
+ * so poll with a cron tick (its timeout sweep POSTs /tick on live rooms,
+ * which re-runs finalize for ended-but-unfinalized rooms).
+ */
+async function waitForEnded(
+  h: Harness,
+  c: LudusClient,
+  gameId: string,
+  timeoutMs = 30_000,
+): Promise<{ status: string; result: Json } | null> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const now = await c.game(gameId);
+    if (now.game.status === 'ended') return { status: now.game.status, result: now.game.result };
+    if (Date.now() >= deadline) return null;
+    await h.tickCron();
+    await sleep(300);
+  }
+}
+
 export async function runMatch(h: Harness, opts: MatchOptions): Promise<MatchReport> {
   const game = GAMES[opts.game];
   if (!game) throw new Error(`unknown game '${opts.game}'`);
@@ -283,8 +316,16 @@ export async function runMatch(h: Harness, opts: MatchOptions): Promise<MatchRep
   }
 
   // 2. Queue + pair. Listed games go through the real signed lobby door;
-  //    unlisted (tictactoe, by spec) are seeded via the shim.
-  await h.configure({ seats: { [opts.game]: n }, per_move_ms: opts.perMoveMs ?? 60_000 });
+  //    unlisted (tictactoe, by spec) are seeded via the shim door. The REAL
+  //    cronTick pairer (src/match/pairing.ts) forms the game on a cron tick —
+  //    it seats meta.players.min agents per queue, so `opts.players` must
+  //    equal players.min for the game.
+  const expectedSeats = game.meta.players.min;
+  if (n !== expectedSeats) {
+    throw new Error(
+      `runMatch(${opts.game}): the product pairer always seats players.min=${expectedSeats}, got players=${n}`,
+    );
+  }
   for (const c of clients) {
     if (game.meta.listed) await c.lobbyJoin(opts.game, variant, division);
     else await h.seedLobby({ game: opts.game, variant, division, agent_id: c.agentId });
@@ -354,8 +395,8 @@ export async function runMatch(h: Harness, opts: MatchOptions): Promise<MatchRep
         view = await c.view(gameId, transports[ix]);
       } catch (e) {
         if (e instanceof LudusApiError && (e.status === 503 || e.status === 409)) {
-          // Room may have ended (timeout/terminal) — finalize and re-check.
-          await h.sweep();
+          // Room may have ended (timeout/terminal); the product finalize
+          // already flips D1 status on every end path — just re-check.
           const now = await c.game(gameId);
           if (now.game.status === 'ended') {
             ended = true;
@@ -425,10 +466,10 @@ export async function runMatch(h: Harness, opts: MatchOptions): Promise<MatchRep
   // Capture any tail events that were emitted before end but not yet polled.
   await pollLive();
 
-  // 5. Finalize (D1 status flip + ratings) and fetch the replay.
-  await h.sweep();
-  const after = await clients[0]!.game(gameId);
-  if (after.game.status !== 'ended') throw new Error(`game ${gameId} room ended but finalize left status '${after.game.status}'`);
+  // 5. The PRODUCT finalize (room end path) flips D1 + uploads R2 + applies
+  //    ratings; wait for the status flip, then fetch the replay.
+  const after = await waitForEnded(h, clients[0]!, gameId);
+  if (!after) throw new Error(`game ${gameId} room ended but the product finalize never flipped D1 status to 'ended'`);
   const { replay } = await clients[0]!.replay(gameId);
   const allEvents = await fetchEvents(h.base, gameId, 0);
   updateFlags(flags, allEvents);
@@ -444,7 +485,7 @@ export async function runMatch(h: Harness, opts: MatchOptions): Promise<MatchRep
     liveEvents,
     allEvents,
     replay: replay as unknown as ReplayFile,
-    result: after.game.result,
+    result: after.result,
     flags,
     timings,
     decisions,
@@ -481,7 +522,10 @@ export interface MisbehaviorReport {
  */
 export async function runMisbehaviorMatch(h: Harness, label = 'misbehave'): Promise<MisbehaviorReport> {
   const gameName = 'connect_drop';
-  const perMoveMs = 8_000;
+  // The room's REAL default per-move clock (rooms/core.ts): the product
+  // pairer passes no clock override and offers no test hook, so the timeout
+  // half of this match genuinely waits out the full 60 s deadline.
+  const perMoveMs = 60_000;
   const clients: LudusClient[] = [];
   for (let i = 0; i < 2; i++) {
     const c = new LudusClient({ base: h.base, handle: `e2e-${label}-${i}`, ip: `10.9.9.${i + 1}` });
@@ -489,7 +533,6 @@ export async function runMisbehaviorMatch(h: Harness, label = 'misbehave'): Prom
     await c.homologate('open');
     clients.push(c);
   }
-  await h.configure({ seats: { [gameName]: 2 }, per_move_ms: perMoveMs });
   for (const c of clients) await c.lobbyJoin(gameName, 'standard', 'open');
   let gameId = '';
   for (let i = 0; i < 30 && !gameId; i++) {
@@ -534,7 +577,6 @@ export async function runMisbehaviorMatch(h: Harness, label = 'misbehave'): Prom
         view = await c.view(gameId);
       } catch (e) {
         if (e instanceof LudusApiError && (e.status === 503 || e.status === 409)) {
-          await h.sweep();
           const now = await c.game(gameId);
           if (now.game.status === 'ended') ended = true;
           continue;
@@ -593,9 +635,8 @@ export async function runMisbehaviorMatch(h: Harness, label = 'misbehave'): Prom
     if (view) await clients[0]!.resign(gameId, view.turn_index);
   }
 
-  await h.sweep();
-  const after = await clients[0]!.game(gameId);
-  if (after.game.status !== 'ended') throw new Error('misbehavior game did not finalize');
+  const after = await waitForEnded(h, clients[0]!, gameId);
+  if (!after) throw new Error('misbehavior game did not finalize (product finalize path)');
   const { replay } = await clients[0]!.replay(gameId);
   const allEvents = await fetchEvents(h.base, gameId, 0);
   if (firstIllegal === null || secondIllegal === null || legalAfterIllegals === null) {
@@ -611,7 +652,7 @@ export async function runMisbehaviorMatch(h: Harness, label = 'misbehave'): Prom
     timedOutPlayer: agents[1]!.player,
     replay: replay as unknown as ReplayFile,
     allEvents,
-    result: after.game.result,
+    result: after.result,
   };
 }
 

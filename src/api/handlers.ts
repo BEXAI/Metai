@@ -215,6 +215,29 @@ const getGameDetail: Handler = async (env, req) => {
   return ok({ game: publicGame(row) }, ['data.game.seats[].handle']);
 };
 
+/** One event shape for live (room-proxied) and ended (D1) games alike. */
+interface PublicEventRow {
+  seq: number;
+  event: Json;
+  created_at: string;
+}
+
+const EVENTS_UNTRUSTED = ['data.events[].event.data.commentary'];
+const EVENTS_PAGE_LIMIT = 500;
+
+function eventsEnvelope(gameId: string, since: number, events: PublicEventRow[]): ApiResult {
+  const last = events[events.length - 1];
+  return ok(
+    {
+      game_id: gameId,
+      since,
+      events: events as unknown as Json,
+      latest_seq: last ? last.seq : since,
+    },
+    EVENTS_UNTRUSTED,
+  );
+}
+
 const getGameEvents: Handler = async (env, req) => {
   const id = req.params.id ?? '';
   const row = await getGameRow(env, id);
@@ -223,18 +246,47 @@ const getGameEvents: Handler = async (env, req) => {
   const wantsSse = (req.headers.get('accept') ?? '').includes('text/event-stream');
 
   if (row.status === 'live') {
-    const res = await roomFetch(env, id, `/events?since=${since}`, {
-      headers: wantsSse ? { accept: 'text/event-stream' } : {},
-    });
-    if (res && res.ok) return res; // proxy the room's JSON or SSE stream as-is
+    if (wantsSse) {
+      // SSE is a raw stream straight from the room — no JSON envelope applies.
+      const sse = await roomFetch(env, id, `/events?since=${since}`, { headers: { accept: 'text/event-stream' } });
+      if (sse && sse.ok) return sse;
+    } else {
+      // JSON: normalize the room's {events:[{seq,type,data,at}],latest_seq}
+      // into the SAME envelope the D1 path serves, so clients never branch
+      // on live-vs-ended shape.
+      const res = await roomFetch(env, id, `/events?since=${since}`);
+      if (res && res.ok) {
+        try {
+          const body = (await res.json()) as { events?: unknown };
+          if (Array.isArray(body.events)) {
+            const events: PublicEventRow[] = [];
+            for (const ev of body.events.slice(0, EVENTS_PAGE_LIMIT)) {
+              if (!isRecord(ev) || typeof ev.seq !== 'number') continue;
+              events.push({
+                seq: ev.seq,
+                event: { type: (ev.type as Json) ?? null, data: (ev.data as Json) ?? null },
+                created_at: typeof ev.at === 'string' ? ev.at : '',
+              });
+            }
+            return eventsEnvelope(id, since, events);
+          }
+        } catch {
+          /* room contract mismatch: fall through to D1 */
+        }
+      }
+    }
   }
   // D1 fallback (also the source for ended games).
   const { results } = await env.DB
-    .prepare('SELECT seq, public_event_json, created_at FROM spectator_events WHERE game_id = ? AND seq > ? ORDER BY seq LIMIT 500')
+    .prepare(`SELECT seq, public_event_json, created_at FROM spectator_events WHERE game_id = ? AND seq > ? ORDER BY seq LIMIT ${EVENTS_PAGE_LIMIT}`)
     .bind(id, since)
     .all<{ seq: number; public_event_json: string; created_at: string }>();
-  const events = results.map((r) => ({ seq: r.seq, event: parseJsonColumn(r.public_event_json), created_at: r.created_at }));
-  return ok({ game_id: id, since, events }, ['data.events[].event.commentary']);
+  const events: PublicEventRow[] = results.map((r) => ({
+    seq: r.seq,
+    event: parseJsonColumn(r.public_event_json),
+    created_at: r.created_at,
+  }));
+  return eventsEnvelope(id, since, events);
 };
 
 const getGameReplay: Handler = async (env, req) => {
@@ -714,9 +766,23 @@ const postMove: Handler = async (env, req) => {
   try {
     const verdict = (await roomRes.json()) as Json;
     if (roomRes.ok) return ok({ verdict }, undefined, roomRes.status);
-    const e = isRecord(verdict) && isRecord(verdict.error) ? verdict.error : null;
-    const code = e && typeof e.code === 'string' ? e.code : 'ROOM_REJECTED';
-    const message = e && typeof e.message === 'string' ? e.message : 'The room rejected the move.';
+    // The room's reject body is flat: { ok:false, code, message,
+    // illegal_attempt?, legal_moves? } (src/rooms/core.ts SubmitReject).
+    // Surface ITS code/message as error.code/error.message so clients can
+    // branch on 'illegal_move', 'not_your_turn', etc. at the top level; the
+    // full verdict (illegal_attempt, restated legal_moves) stays in
+    // error-envelope `data`. 'ROOM_REJECTED' only when the room supplied no
+    // code at all.
+    const rec = isRecord(verdict) ? verdict : null;
+    const nested = rec && isRecord(rec.error) ? rec.error : null;
+    const code =
+      rec && typeof rec.code === 'string' ? rec.code
+      : nested && typeof nested.code === 'string' ? nested.code
+      : 'ROOM_REJECTED';
+    const message =
+      rec && typeof rec.message === 'string' ? rec.message
+      : nested && typeof nested.message === 'string' ? nested.message
+      : 'The room rejected the move.';
     return err(roomRes.status, code, message, verdict);
   } catch {
     return err(502, 'ROOM_BAD_RESPONSE', 'The game room returned a non-JSON response.');

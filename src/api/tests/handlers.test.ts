@@ -48,31 +48,52 @@ describe('games list and detail', () => {
 });
 
 describe('events', () => {
-  it('proxies the live room and falls back to D1 when the room is down', async () => {
+  interface EventRow {
+    seq: number;
+    event: { type: string; data: { notation?: string } };
+    created_at: string;
+  }
+
+  it('serves ONE envelope shape for live (room) and ended/fallback (D1) games', async () => {
     const env = makeTestEnv();
     insertGame(env, { id: 'g_1', game: 'toy', status: 'live' });
     env.rooms.script = () =>
-      new Response(JSON.stringify({ events: [{ seq: 3, type: 'move' }], latest_seq: 3 }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
-    const viaRoom = (await (await handleApiRequest(env, apiRequest('GET', '/api/games/g_1/events?since=2'))).json()) as {
-      events: { seq: number }[];
-    };
-    expect(viaRoom.events[0]?.seq).toBe(3);
+      new Response(
+        JSON.stringify({
+          events: [{ seq: 3, type: 'move', data: { player: 'p0', notation: 'b2' }, at: '2026-09-01T10:20:00Z' }],
+          latest_seq: 3,
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    const viaRoom = await envelope(await handleApiRequest(env, apiRequest('GET', '/api/games/g_1/events?since=2')));
+    expect(viaRoom.ok).toBe(true);
+    const roomEvents = viaRoom.data?.events as EventRow[];
+    expect(roomEvents).toEqual([
+      { seq: 3, event: { type: 'move', data: { player: 'p0', notation: 'b2' } }, created_at: '2026-09-01T10:20:00Z' },
+    ]);
+    expect(viaRoom.data?.latest_seq).toBe(3);
+    expect(viaRoom.data?.game_id).toBe('g_1');
     expect(env.rooms.calls[0]?.url).toContain('/events?since=2');
 
-    // Room down -> D1 fallback.
+    // Room down -> D1 fallback: SAME envelope, SAME event shape.
     env.rooms.script = () => {
       throw new Error('DO unavailable');
     };
     env.db.db
       .prepare("INSERT INTO spectator_events (game_id, seq, public_event_json, created_at) VALUES ('g_1', 5, ?, '2026-09-01T10:30:00Z')")
-      .run(JSON.stringify({ type: 'move', notation: 'a1' }));
+      .run(JSON.stringify({ type: 'move', data: { notation: 'a1' } }));
     const viaD1 = await envelope(await handleApiRequest(env, apiRequest('GET', '/api/games/g_1/events?since=4')));
-    const events = viaD1.data?.events as { seq: number; event: { notation: string } }[];
-    expect(events.length).toBe(1);
-    expect(events[0]?.event.notation).toBe('a1');
+    const events = viaD1.data?.events as EventRow[];
+    expect(events).toEqual([
+      { seq: 5, event: { type: 'move', data: { notation: 'a1' } }, created_at: '2026-09-01T10:30:00Z' },
+    ]);
+    expect(viaD1.data?.latest_seq).toBe(5);
+
+    // Ended game -> D1, still the same envelope; empty page echoes `since`.
+    env.db.db.prepare("UPDATE games SET status = 'ended', ended_at = '2026-09-01T11:00:00Z' WHERE id = 'g_1'").run();
+    const ended = await envelope(await handleApiRequest(env, apiRequest('GET', '/api/games/g_1/events?since=5')));
+    expect(ended.data?.events).toEqual([]);
+    expect(ended.data?.latest_seq).toBe(5);
   });
 });
 
@@ -272,13 +293,21 @@ describe('moves', () => {
     expect(env.rooms.calls.length).toBe(0);
   });
 
-  it('surfaces the room rejection (reason + restated legal list) in the error envelope', async () => {
+  it("surfaces the room's flat rejection code as error.code, with the full verdict in data", async () => {
     const env = makeTestEnv();
     const agent = insertAgent(env, 'alice');
     insertGame(env, { id: 'g_1', game: 'toy', status: 'live', seats: [seat(agent)] });
+    // The REAL room reject body is flat (src/rooms/core.ts SubmitReject):
+    // { ok:false, code, message, illegal_attempt?, legal_moves? }.
     env.rooms.script = () =>
       new Response(
-        JSON.stringify({ ok: false, error: { code: 'illegal_move', message: 'not legal now' }, legal_moves: ['a1', 'b2'] }),
+        JSON.stringify({
+          ok: false,
+          code: 'illegal_move',
+          message: 'illegal move (attempt 2 of this turn): square occupied',
+          illegal_attempt: 2,
+          legal_moves: [{ index: 0, move: 'a1', notation: 'a1' }],
+        }),
         { status: 400, headers: { 'content-type': 'application/json' } },
       );
     const body = JSON.stringify({ game_id: 'g_1', turn_index: 0, move: 'z9', signature: 'ab'.repeat(64) });
@@ -286,7 +315,22 @@ describe('moves', () => {
     const res = await handleApiRequest(env, apiRequest('POST', '/api/games/g_1/moves', { headers, body }));
     expect(res.status).toBe(400);
     const out = await envelope(res);
-    expect(out.error?.code).toBe('illegal_move');
-    expect((out.data as unknown as { legal_moves: string[] }).legal_moves).toEqual(['a1', 'b2']);
+    expect(out.error?.code).toBe('illegal_move'); // NOT buried in data
+    expect(out.error?.message).toContain('attempt 2');
+    const data = out.data as unknown as { illegal_attempt: number; legal_moves: { notation: string }[] };
+    expect(data.illegal_attempt).toBe(2);
+    expect(data.legal_moves[0]?.notation).toBe('a1');
+  });
+
+  it('falls back to ROOM_REJECTED only when the room body carries no code', async () => {
+    const env = makeTestEnv();
+    const agent = insertAgent(env, 'alice');
+    insertGame(env, { id: 'g_1', game: 'toy', status: 'live', seats: [seat(agent)] });
+    env.rooms.script = () =>
+      new Response(JSON.stringify({ ok: false }), { status: 400, headers: { 'content-type': 'application/json' } });
+    const body = JSON.stringify({ game_id: 'g_1', turn_index: 0, move: 'z9', signature: 'ab'.repeat(64) });
+    const headers = { ...(await signedHeaders(env, agent, 'POST', '/api/games/g_1/moves', body)), 'content-type': 'application/json' };
+    const out = await envelope(await handleApiRequest(env, apiRequest('POST', '/api/games/g_1/moves', { headers, body })));
+    expect(out.error?.code).toBe('ROOM_REJECTED');
   });
 });
