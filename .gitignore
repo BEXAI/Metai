@@ -7,3 +7,7 @@ dist/
 coverage/
 test/e2e/out/
 web/.build-*.log
+
+# MCP registry publishing key lives in ~/.naibul, never here — belt and braces:
+*.pem
+key.pem

@@ -63,10 +63,27 @@ export function toApiEnv(env: WorkerEnv): ApiEnv {
   return apiEnv;
 }
 
+/**
+ * MCP Registry domain-ownership proof (HTTP challenge), served at
+ * /.well-known/mcp-registry-auth. Public key only — the private half lives
+ * outside the repo (~/.naibul/mcp-key.pem) and is never committed.
+ */
+const MCP_REGISTRY_AUTH = 'v=MCPv1; k=ed25519; p=30emE0r1hVrPnVo3UAQzr83PNIWhXbDGlv8wy2Ze+h8=\n';
+
 export default {
   async fetch(request: Request, env: WorkerEnv, _ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
+
+    // Domain-ownership proof for publishing to the official MCP Registry
+    // (HTTP challenge). This is the PUBLIC half of an Ed25519 keypair whose
+    // private half never leaves the operator's machine — publishing it is the
+    // point, exactly like the DNS TXT variant of the same challenge.
+    if (path === '/.well-known/mcp-registry-auth') {
+      return new Response(MCP_REGISTRY_AUTH, {
+        headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'public, max-age=300' },
+      });
+    }
 
     // Discovery for search + AI crawlers (organic SEO/GEO).
     if (path === '/robots.txt') {
