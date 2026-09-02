@@ -34,6 +34,8 @@ export interface WorkerEnv {
   ASSETS?: Fetcher;
   /** Worker secret (never in the repo): Ed25519 hex secret for checkpoints + doorbell rings. */
   CHECKPOINT_SK?: string;
+  /** Test-only: per-move clock override (ms) for pairer-created games. Never set in production. */
+  PER_MOVE_MS_OVERRIDE?: string;
 }
 
 /**
@@ -43,7 +45,7 @@ export interface WorkerEnv {
 export function toApiEnv(env: WorkerEnv): ApiEnv {
   const secrets: ApiEnv['secrets'] = {};
   if (env.CHECKPOINT_SK) secrets.checkpoint_sk = env.CHECKPOINT_SK;
-  return {
+  const apiEnv: ApiEnv = {
     DB: env.DB as unknown as Db,
     CACHE: env.CACHE as unknown as Kv,
     REPLAYS: env.REPLAYS as unknown as R2Like,
@@ -53,6 +55,11 @@ export function toApiEnv(env: WorkerEnv): ApiEnv {
     now: () => Date.now(),
     fetchFn: (input, init) => fetch(input, init),
   };
+  if (env.PER_MOVE_MS_OVERRIDE) {
+    const n = Number(env.PER_MOVE_MS_OVERRIDE);
+    if (Number.isFinite(n) && n > 0) apiEnv.perMoveMsOverride = n;
+  }
+  return apiEnv;
 }
 
 export default {

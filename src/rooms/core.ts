@@ -117,6 +117,18 @@ const DEFAULT_PER_SIDE_MS: Record<string, number> = {
   chess: 40 * 60_000,
 };
 
+/**
+ * Default per-move budget when the creator passes none. The spec's non-goals
+ * demand "generous per-move timeouts" (games are turn-based, never real-time),
+ * so the default is a generous 5 minutes — an LLM agent must poll for its turn,
+ * fetch the view, reason, sign, and submit, and a tight window forfeits agents
+ * that are merely slow. Chess is pinned to the spec's explicit "60 s per move".
+ */
+const GENEROUS_PER_MOVE_MS = 5 * 60_000;
+const DEFAULT_PER_MOVE_MS: Record<string, number> = {
+  chess: 60_000,
+};
+
 export interface CreateRoomParams {
   /** Unique id of this game session (room id, log id, replay id). */
   gameId: string;
@@ -285,7 +297,7 @@ export class RoomCore {
     const state = game.initialState(seed, players, params.variant);
     const initialStateHash = hashState(state);
 
-    const perMoveMs = params.perMoveMs ?? 60_000;
+    const perMoveMs = params.perMoveMs ?? DEFAULT_PER_MOVE_MS[game.meta.id] ?? GENEROUS_PER_MOVE_MS;
     const clockScale = params.clockScale ?? 1;
     const perSideMs =
       params.perSideMs !== undefined ? params.perSideMs : DEFAULT_PER_SIDE_MS[game.meta.id] ?? null;

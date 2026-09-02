@@ -11,6 +11,10 @@
   "main": "worker.ts",
   "compatibility_date": "2026-08-01",
   "compatibility_flags": ["nodejs_compat"],
+  // Test-only: shorten the pairer-created games' per-move clock so the A11
+  // timeout test does not wait out the generous production default. Read by
+  // toApiEnv -> d1GameFactory. NEVER set on a production deployment.
+  "vars": { "PER_MOVE_MS_OVERRIDE": "10000" },
   "assets": {
     "directory": "../../web/public",
     "binding": "ASSETS"

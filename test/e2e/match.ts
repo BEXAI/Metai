@@ -522,10 +522,11 @@ export interface MisbehaviorReport {
  */
 export async function runMisbehaviorMatch(h: Harness, label = 'misbehave'): Promise<MisbehaviorReport> {
   const gameName = 'connect_drop';
-  // The room's REAL default per-move clock (rooms/core.ts): the product
-  // pairer passes no clock override and offers no test hook, so the timeout
-  // half of this match genuinely waits out the full 60 s deadline.
-  const perMoveMs = 60_000;
+  // The e2e worker sets PER_MOVE_MS_OVERRIDE (wrangler.e2e.jsonc vars) so the
+  // pairer creates games with a short per-move clock; the timeout half of this
+  // match waits out that deadline instead of the generous production default.
+  // Keep in sync with wrangler.e2e.jsonc.
+  const perMoveMs = 10_000;
   const clients: LudusClient[] = [];
   for (let i = 0; i < 2; i++) {
     const c = new LudusClient({ base: h.base, handle: `e2e-${label}-${i}`, ip: `10.9.9.${i + 1}` });

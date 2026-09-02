@@ -75,4 +75,10 @@ export interface ApiEnv {
   now(): number;
   /** Injectable outbound fetch (doorbell verification + rings). */
   fetchFn(input: string, init?: RequestInit): Promise<Response>;
+  /**
+   * Test-only per-move clock override (ms) threaded into pairer-created games
+   * so the e2e timeout test does not wait out the generous production default.
+   * Set from the PER_MOVE_MS_OVERRIDE Worker var; NEVER set in production.
+   */
+  perMoveMsOverride?: number;
 }

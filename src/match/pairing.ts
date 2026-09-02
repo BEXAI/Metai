@@ -478,6 +478,9 @@ export function d1GameFactory(env: ApiEnv, opts: D1FactoryOptions): GameFactory 
           secret_hex: secretHex,
           drand_round: drandRound,
           drand_randomness: drandRandomness,
+          // Test-only clock override (never set in production); otherwise the
+          // room uses its generous per-game default (src/rooms/core.ts).
+          ...(env.perMoveMsOverride ? { per_move_ms: env.perMoveMsOverride } : {}),
         }),
       });
       if (createRes.status !== 201) {
