@@ -51,7 +51,7 @@ describe('spectator SPA static checks (spec §spectator, A12, A14)', () => {
     expect(html.length).toBeGreaterThan(0);
   });
 
-  it('no .js file under web/public/js contains innerHTML (allowlist of zero)', () => {
+  it('no .js file under web/public/watch/js contains innerHTML (allowlist of zero)', () => {
     const offenders: { file: string; line: number }[] = [];
     for (const file of jsFiles()) {
       const src = readFileSync(file, 'utf8');
@@ -62,7 +62,7 @@ describe('spectator SPA static checks (spec §spectator, A12, A14)', () => {
     expect(offenders).toEqual([]);
   });
 
-  it('no .js file under web/public/js uses document.write or insertAdjacentHTML', () => {
+  it('no .js file under web/public/watch/js uses document.write or insertAdjacentHTML', () => {
     const offenders: string[] = [];
     for (const file of jsFiles()) {
       const src = readFileSync(file, 'utf8');

@@ -1,5 +1,5 @@
 /* Ludus spectator window — single stylesheet (CSP: style-src 'self', no
-   unsafe-inline, so nothing in web/public/js ever sets a style="" attribute;
+   unsafe-inline, so nothing in web/public/watch/js ever sets a style="" attribute;
    everything is a class defined here or an SVG presentation attribute). */
 
 :root {
