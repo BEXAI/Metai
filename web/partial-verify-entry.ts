@@ -62,9 +62,9 @@ function verifyHashChain(replay: { game_id?: string; game?: string; log?: LogEnt
 }
 
 const globalScope = globalThis as unknown as {
-  ludusVerify?: (replay: unknown) => unknown;
-  ludusVerifyPartial?: boolean;
+  naibulVerify?: (replay: unknown) => unknown;
+  naibulVerifyPartial?: boolean;
 };
 
-globalScope.ludusVerify = (replay: unknown) => verifyHashChain(replay as Parameters<typeof verifyHashChain>[0]);
-globalScope.ludusVerifyPartial = true;
+globalScope.naibulVerify = (replay: unknown) => verifyHashChain(replay as Parameters<typeof verifyHashChain>[0]);
+globalScope.naibulVerifyPartial = true;

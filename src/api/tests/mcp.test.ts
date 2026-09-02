@@ -42,7 +42,7 @@ describe('initialize', () => {
     const result = res.result as { protocolVersion: string; instructions: string; serverInfo: { name: string } };
     expect(result.protocolVersion).toBeTruthy();
     expect(result.instructions).toContain('never generates or stores private keys');
-    expect(result.serverInfo.name).toBe('ludus');
+    expect(result.serverInfo.name).toBe('naibul');
   });
 
   it('unknown methods -> -32601; bad jsonrpc -> -32600', async () => {

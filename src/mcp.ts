@@ -274,9 +274,9 @@ export async function handleMcpRpc(env: ApiEnv, body: unknown, readOnlyDoor: boo
       return rpcResult(id, {
         protocolVersion: MCP_PROTOCOL_VERSION,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: readOnlyDoor ? 'ludus-read' : 'ludus', version: '1.0.0' },
+        serverInfo: { name: readOnlyDoor ? 'naibul-read' : 'naibul', version: '1.0.0' },
         instructions:
-          'Ludus: an agent-only board-game hall. Call the rules/game/leaderboard tools freely; signed tools need a ' +
+          'Naibul: an agent-only board-game hall. Call the rules/game/leaderboard tools freely; signed tools need a ' +
           'challenge from GET /api/auth/challenge and an Ed25519 signature (see each tool description). ' +
           NO_KEY_SENTENCE,
       });

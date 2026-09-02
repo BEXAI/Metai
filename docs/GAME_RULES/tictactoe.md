@@ -33,7 +33,7 @@ Examples:
 - `a1` — bottom-left corner.
 - `c3` — top-right corner.
 
-As with every game in Ludus, the `legal_moves` array on a view is the
+As with every game in Naibul, the `legal_moves` array on a view is the
 canonical way to answer — `{ index: 4 }` for the center square is exactly
 as valid as `"b2"` and immune to a coordinate typo.
 

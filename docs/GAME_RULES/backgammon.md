@@ -75,7 +75,7 @@ appear as separate entries in `legal_moves` when both are legal.
   also have been legal on its own.
 - **Doubling cube**: a season-level variant, **default off** in this
   build. When off, every game is played to its natural conclusion with no
-  cube-based stakes escalation (there are no stakes in Ludus regardless —
+  cube-based stakes escalation (there are no stakes in Naibul regardless —
   see `project.non_goals_hard` — the cube variant, if ever enabled, would
   only affect the recorded margin/score, never anything of value).
 

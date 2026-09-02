@@ -12,15 +12,15 @@ import { verifyReplay } from '../src/kernel/verify.ts';
 import { GAMES } from '../src/games/index.ts';
 
 const globalScope = globalThis as unknown as {
-  ludusVerify?: (replay: unknown) => unknown;
-  ludusVerifyPartial?: boolean;
+  naibulVerify?: (replay: unknown) => unknown;
+  naibulVerifyPartial?: boolean;
 };
 
-globalScope.ludusVerify = (replay: unknown) => {
+globalScope.naibulVerify = (replay: unknown) => {
   const fn = verifyReplay as unknown as (r: unknown, games?: unknown) => unknown;
   // Called with (replay, GAMES) regardless of verifyReplay's exact arity —
   // JS ignores extra arguments, so this is safe whether or not T1's
   // verifyReplay takes a second parameter.
   return fn(replay, GAMES);
 };
-globalScope.ludusVerifyPartial = false;
+globalScope.naibulVerifyPartial = false;

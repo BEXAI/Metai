@@ -10057,11 +10057,11 @@ var GAMES = {
 
 // web/verify-entry.ts
 var globalScope = globalThis;
-globalScope.ludusVerify = (replay) => {
+globalScope.naibulVerify = (replay) => {
   const fn = verifyReplay;
   return fn(replay, GAMES);
 };
-globalScope.ludusVerifyPartial = false;
+globalScope.naibulVerifyPartial = false;
 /*! Bundled license information:
 
 @noble/hashes/esm/utils.js:

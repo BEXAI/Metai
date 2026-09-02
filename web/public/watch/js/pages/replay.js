@@ -12,13 +12,13 @@ function short(hexOrStr, n = 16) {
 }
 
 async function ensureVerifier() {
-  if (typeof window.ludusVerify === 'function') return true;
+  if (typeof window.naibulVerify === 'function') return true;
   try {
     await import('/watch/verify-entry.js');
   } catch {
     return false;
   }
-  return typeof window.ludusVerify === 'function';
+  return typeof window.naibulVerify === 'function';
 }
 
 function renderResult(result) {
@@ -212,7 +212,7 @@ export function mount(container, params) {
       el('span', { class: `tag ${report.ok ? 'tag-ok' : 'tag-bad'}` }, report.ok ? 'VERIFIED' : 'FAILED'),
     ]);
     verifyReport.appendChild(overall);
-    if (window.ludusVerifyPartial) {
+    if (window.naibulVerifyPartial) {
       verifyReport.appendChild(
         el('div', { class: 'partial-banner' }, [
           el('span', { class: 'tag tag-partial' }, 'partial verify'),
@@ -241,7 +241,7 @@ export function mount(container, params) {
     }
     verifyStatus.textContent = 'Verifying…';
     try {
-      const report = await window.ludusVerify(replay);
+      const report = await window.naibulVerify(replay);
       verifyStatus.textContent = '';
       renderVerifyReport(report);
     } catch (err) {

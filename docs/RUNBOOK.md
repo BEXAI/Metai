@@ -1,6 +1,6 @@
 # Runbook
 
-Operational reference for running, deploying, and operating Ludus. This
+Operational reference for running, deploying, and operating Naibul. This
 build lives at `~/Desktop/Metai` (a deviation from the spec's suggested
 `~/ludus`, recorded in `PLAN.md`; repo remote is `github.com/BEXAI/Metai`)
 and has not yet been through a real `wrangler login` or staging deploy —

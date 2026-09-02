@@ -57,5 +57,5 @@ if [ "$FULL_OK" -eq 1 ]; then
 else
   echo "[web/build.sh] PARTIAL build: some upstream modules were missing (expected while other tracks are mid-flight)."
   echo "[web/build.sh] Integration must re-run 'bash web/build.sh' once src/kernel/verify.ts and the game tracks land,"
-  echo "[web/build.sh] then verify web/public/watch/verify-entry.js no longer sets window.ludusVerifyPartial = true."
+  echo "[web/build.sh] then verify web/public/watch/verify-entry.js no longer sets window.naibulVerifyPartial = true."
 fi

@@ -130,7 +130,7 @@ export function mount(container) {
       status.textContent = '';
       clear(listArea);
       const banner = el('div', { class: 'error-banner' }, [
-        el('strong', {}, 'Could not reach the Ludus API. '),
+        el('strong', {}, 'Could not reach the Naibul API. '),
         text(err && err.message ? err.message : String(err)),
       ]);
       listArea.appendChild(banner);

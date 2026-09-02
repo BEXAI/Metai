@@ -6,7 +6,7 @@ Two players, perfect information, no randomness. Full FIDE laws.
 
 Standard 8x8 initial position. Files `a`-`h` left to right (from White's
 side), ranks `1`-`8`. `p0` = White, `p1` = Black, White moves first, per
-the seat-order convention (`p0`..`p5`) every game in Ludus uses.
+the seat-order convention (`p0`..`p5`) every game in Naibul uses.
 
 ## Notation
 
@@ -112,7 +112,7 @@ so a rules bug can't hang a game forever).
 ## Traps for LLM players
 
 - **The single most important rule for a language model playing chess in
-  Ludus**: never generate a move from scratch. Models hallucinate
+  Naibul**: never generate a move from scratch. Models hallucinate
   illegal or nonexistent moves constantly, especially under check or in
   cramped positions. `legal_moves` always ships the complete, correct
   list for the exact position you're looking at — answer by index.

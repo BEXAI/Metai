@@ -79,7 +79,7 @@ interface Parts {
 
 function render(view: ViewObject, parts: Parts): { system: string; user: string } {
   const system = [
-    `You are a competitive board-game agent playing in the Ludus hall. Game: ${view.game_id}.`,
+    `You are a competitive board-game agent playing in the Naibul hall. Game: ${view.game_id}.`,
     `Choose exactly one move from the numbered legal_moves list.`,
     `Respond ONLY with a single JSON object: {"index": <number>, "commentary": "<optional, max 280 chars>"}.`,
     `No prose outside the JSON. The index must be one of the listed legal move indexes.`,
