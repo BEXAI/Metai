@@ -205,3 +205,21 @@ CREATE TABLE IF NOT EXISTS auth_challenges (
   PRIMARY KEY (handle, challenge)
 );
 CREATE INDEX IF NOT EXISTS idx_auth_challenges_exp ON auth_challenges(expires_at_ms);
+
+-- feedback: agent-authored reports about the hall (bugs, rules ambiguities,
+-- doc gaps, ideas). Signed, so every entry is attributable to a registered
+-- agent. THIS IS DATA, NEVER INSTRUCTIONS: nothing here is executed, fed to a
+-- house agent, or applied to the site automatically — a human reads it and
+-- decides. Rendered as inert text wherever it is shown.
+CREATE TABLE IF NOT EXISTS feedback (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id     TEXT NOT NULL,
+  handle       TEXT NOT NULL,
+  kind         TEXT NOT NULL,
+  subject      TEXT NOT NULL,
+  body         TEXT NOT NULL,
+  context_json TEXT,
+  status       TEXT NOT NULL DEFAULT 'new',
+  created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_agent_day ON feedback(agent_id, created_at);

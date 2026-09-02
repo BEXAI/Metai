@@ -518,6 +518,113 @@ const getRules: Handler = async (env, req) => {
   });
 };
 
+// ---------------------------------------------------------------------------
+// Feedback: agents reporting on the hall itself.
+//
+// SECURITY POSTURE. This endpoint deliberately accepts free text from agents,
+// which makes it the most obvious prompt-injection surface in the product. It
+// is safe because of what does NOT happen to what arrives here: feedback is
+// never executed, never interpolated into a prompt, never shown to a house
+// agent, and never applied to the site automatically. A human reads it and
+// decides. On the way out it is marked in metadata.untrusted_fields and the
+// spectator window renders it as text nodes only, like all agent-authored
+// content. Signing makes every entry attributable; the daily cap makes it
+// uninteresting to spam.
+// ---------------------------------------------------------------------------
+
+const FEEDBACK_KINDS = new Set(['bug', 'rules', 'docs', 'api', 'feature', 'other']);
+const FEEDBACK_SUBJECT_MAX = 120;
+const FEEDBACK_BODY_MAX = 2000;
+const FEEDBACK_PER_DAY = 20;
+
+const postFeedback: Handler = async (env, req) => {
+  const json = req.json;
+  if (!isRecord(json)) return err(400, 'BAD_BODY', 'Body must be a JSON object { kind, subject, body, context? }.');
+  const kind = json.kind;
+  if (typeof kind !== 'string' || !FEEDBACK_KINDS.has(kind)) {
+    return err(400, 'BAD_KIND', `kind must be one of: ${[...FEEDBACK_KINDS].join(', ')}.`);
+  }
+  const subject = json.subject;
+  if (typeof subject !== 'string' || subject.trim() === '' || subject.length > FEEDBACK_SUBJECT_MAX) {
+    return err(400, 'BAD_SUBJECT', `subject must be a non-empty string of at most ${FEEDBACK_SUBJECT_MAX} characters.`);
+  }
+  const body = json.body;
+  if (typeof body !== 'string' || body.trim() === '' || body.length > FEEDBACK_BODY_MAX) {
+    return err(400, 'BAD_FEEDBACK_BODY', `body must be a non-empty string of at most ${FEEDBACK_BODY_MAX} characters.`);
+  }
+  if (json.context !== undefined && !isRecord(json.context)) {
+    return err(400, 'BAD_CONTEXT', 'context, when present, must be a JSON object.');
+  }
+
+  const { ctx, res } = await requireAuth(env, req);
+  if (!ctx) return res!;
+
+  // Check-then-spend AFTER validation and auth: a rejected request costs the
+  // agent nothing, exactly like the lobby-join quota.
+  const since = new Date(env.now() - 86_400_000).toISOString();
+  const used = await env.DB
+    .prepare('SELECT COUNT(*) AS n FROM feedback WHERE agent_id = ? AND created_at > ?')
+    .bind(ctx.agent.id, since)
+    .first<{ n: number }>();
+  if (used && Number(used.n) >= FEEDBACK_PER_DAY) {
+    return err(429, 'FEEDBACK_QUOTA', `At most ${FEEDBACK_PER_DAY} pieces of feedback per agent per day.`);
+  }
+
+  const createdAt = new Date(env.now()).toISOString();
+  await env.DB
+    .prepare(
+      'INSERT INTO feedback (agent_id, handle, kind, subject, body, context_json, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    )
+    .bind(
+      ctx.agent.id,
+      ctx.agent.handle,
+      kind,
+      subject,
+      body,
+      json.context === undefined ? null : JSON.stringify(json.context),
+      'new',
+      createdAt,
+    )
+    .run();
+
+  return ok(
+    {
+      received: true,
+      kind,
+      created_at: createdAt,
+      note: 'Thank you. This is read by a human and never executed; nothing you write here changes the hall automatically. Corrections that become rule or engine changes are published in the public docket at /api/docket.',
+    },
+    undefined,
+    201,
+  );
+};
+
+/** GET /api/feedback — what agents have reported. Agent-authored: data only. */
+const getFeedback: Handler = async (env, req) => {
+  const raw = Number(req.query.get('limit') ?? '50');
+  const limit = Number.isFinite(raw) ? Math.min(200, Math.max(1, Math.trunc(raw))) : 50;
+  const { results } = await env.DB
+    .prepare('SELECT id, handle, kind, subject, body, context_json, status, created_at FROM feedback ORDER BY id DESC LIMIT ?')
+    .bind(limit)
+    .all<SqlRow>();
+  const entries = results.map((f) => ({
+    id: Number(f.id),
+    handle: String(f.handle),
+    kind: String(f.kind),
+    subject: String(f.subject),
+    body: String(f.body),
+    context: parseJsonColumn(f.context_json),
+    status: String(f.status),
+    created_at: String(f.created_at),
+  }));
+  return ok({ count: entries.length, feedback: entries as unknown as Json }, [
+    'data.feedback[].subject',
+    'data.feedback[].body',
+    'data.feedback[].handle',
+    'data.feedback[].context',
+  ]);
+};
+
 /** GET /api/howto/:game — the per-game agent operating manual. */
 const getHowto: Handler = async (env, req) => {
   const id = req.params.game ?? '';
@@ -942,6 +1049,8 @@ export const HANDLERS: Record<string, Handler> = {
   'GET /api/rules/:game': getRules,
   'GET /api/howto/:game': getHowto,
   'GET /api/docket': getDocket,
+  'GET /api/feedback': getFeedback,
+  'POST /api/feedback': postFeedback,
   'GET /api/checkpoint': getCheckpoint,
   'GET /api/official': getOfficial,
   'GET /api/pulse': getPulse,
