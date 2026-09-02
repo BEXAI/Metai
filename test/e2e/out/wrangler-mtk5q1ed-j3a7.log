@@ -1,0 +1,84 @@
+
+ ⛅️ wrangler 4.128.0
+────────────────────
+Your Worker has access to the following bindings:
+Binding                                                   Resource                  Mode
+env.GAME_ROOM (GameRoom)                                  Durable Object            local
+env.CACHE (00000000000000000000000000000000)              KV Namespace              local
+env.DB (ludus)                                            D1 Database               local
+env.REPLAYS (ludus-replays)                               R2 Bucket                 local
+env.ASSETS                                                Assets                    local
+env.CHECKPOINT_SK ("(hidden)")                            Environment Variable      local
+
+⎔ Starting local server...
+Wrangler detected this dev session is running in an AI agent.
+The Local Explorer API is available at http://localhost:8788/cdn-cgi/local/explorer/api
+Useful routes:
+  GET http://localhost:8788/cdn-cgi/local/explorer/api/local/workers - local Workers and bindings
+  GET http://localhost:8788/cdn-cgi/local/explorer/api/storage/kv/namespaces - KV namespaces
+  GET http://localhost:8788/cdn-cgi/local/explorer/api/d1/database - D1 databases
+  GET http://localhost:8788/cdn-cgi/local/explorer/api/r2/buckets - R2 buckets
+  GET http://localhost:8788/cdn-cgi/local/explorer/api/workers/durable_objects/namespaces - Durable Object namespaces
+  GET http://localhost:8788/cdn-cgi/local/explorer/api/workflows - Workflows
+  POST http://localhost:8788/cdn-cgi/local/explorer/api/local/observability/query - run a read-only SQL query (SELECT/WITH only) over captured request traces and console logs. Tables: spans, logs (read attributes via json(attributes)). Example:
+    curl -X POST http://localhost:8788/cdn-cgi/local/explorer/api/local/observability/query -H 'Content-Type: application/json' -d '{"sql":"SELECT service, name, outcome, duration_ms FROM spans WHERE parent_id IS NULL LIMIT 20"}'
+If the routes above don't cover what you need, fetch the full OpenAPI schema (large - use only as a last resort):
+  GET http://localhost:8788/cdn-cgi/local/explorer/api - OpenAPI schema
+[wrangler:info] Ready on http://localhost:8788
+[wrangler:info] GET /e2e/ping 200 OK (23ms)
+[wrangler:info] GET /api/auth/challenge 200 OK (17ms)
+[wrangler:info] POST /api/agents 201 Created (27ms)
+[wrangler:info] GET /api/auth/challenge 200 OK (3ms)
+[wrangler:info] POST /api/agents/a_30a366308288f202274c1601cc9d3db2/homologate 201 Created (6ms)
+[wrangler:info] GET /api/auth/challenge 200 OK (2ms)
+[wrangler:info] POST /api/agents 201 Created (4ms)
+[wrangler:info] GET /api/auth/challenge 200 OK (3ms)
+[wrangler:info] POST /api/agents/a_c7457bc1ffde2b5dda5dd6a6b019662c/homologate 201 Created (5ms)
+[wrangler:info] POST /e2e/config 200 OK (2ms)
+[wrangler:info] GET /api/auth/challenge 200 OK (2ms)
+[wrangler:info] POST /api/lobby/join 400 Bad Request (2ms)
+[wrangler:info] POST /e2e/lobby 200 OK (2ms)
+[wrangler:info] POST /e2e/lobby 200 OK (1ms)
+[wrangler:info] GET /__scheduled 200 OK (2ms)
+cron checkpoint: ok — signed root e3b0c44298fc… over 0 leaves
+cron doorbells: ok — no verified doorbells
+cron timeouts: ok — ticked 0/0 live rooms
+cron match: ok — skipped: src/match/pairing.ts has no cronTick(env) export yet
+cron witness: ok — skipped: not the daily window (00:00-00:05 UTC)
+e2e sweep: {"pairing":{"created":[{"game_id":"game_e2e_185fa02907fd4739","game":"tictactoe"}]},"finalize":{"finalized":[],"ratings_updated":0}}
+[wrangler:info] GET /api/auth/challenge 200 OK (8ms)
+[wrangler:info] GET /api/my/games 200 OK (16ms)
+[wrangler:info] GET /api/games/game_e2e_185fa02907fd4739 200 OK (3ms)
+[wrangler:info] GET /api/auth/challenge 200 OK (2ms)
+[wrangler:info] GET /api/games/game_e2e_185fa02907fd4739/view 200 OK (7ms)
+[wrangler:info] GET /api/auth/challenge 200 OK (4ms)
+[wrangler:info] POST /api/games/game_e2e_185fa02907fd4739/moves 200 OK (7ms)
+[wrangler:info] GET /api/auth/challenge 200 OK (3ms)
+[wrangler:info] GET /api/games/game_e2e_185fa02907fd4739/view 200 OK (5ms)
+[wrangler:info] GET /api/auth/challenge 200 OK (3ms)
+[wrangler:info] POST /api/games/game_e2e_185fa02907fd4739/moves 200 OK (6ms)
+[wrangler:info] GET /api/auth/challenge 200 OK (3ms)
+[wrangler:info] GET /api/games/game_e2e_185fa02907fd4739/view 200 OK (6ms)
+[wrangler:info] GET /api/auth/challenge 200 OK (3ms)
+[wrangler:info] POST /api/games/game_e2e_185fa02907fd4739/moves 200 OK (5ms)
+[wrangler:info] GET /api/auth/challenge 200 OK (2ms)
+[wrangler:info] GET /api/games/game_e2e_185fa02907fd4739/view 200 OK (4ms)
+[wrangler:info] GET /api/auth/challenge 200 OK (2ms)
+[wrangler:info] POST /api/games/game_e2e_185fa02907fd4739/moves 200 OK (5ms)
+[wrangler:info] GET /api/auth/challenge 200 OK (2ms)
+[wrangler:info] GET /api/games/game_e2e_185fa02907fd4739/view 200 OK (4ms)
+[wrangler:info] GET /api/auth/challenge 200 OK (4ms)
+[wrangler:info] POST /api/games/game_e2e_185fa02907fd4739/moves 200 OK (5ms)
+[wrangler:info] GET /api/auth/challenge 200 OK (4ms)
+[wrangler:info] GET /api/games/game_e2e_185fa02907fd4739/view 200 OK (5ms)
+[wrangler:info] GET /api/auth/challenge 200 OK (2ms)
+[wrangler:info] POST /api/games/game_e2e_185fa02907fd4739/moves 200 OK (6ms)
+[wrangler:info] GET /api/auth/challenge 200 OK (3ms)
+[wrangler:info] GET /api/games/game_e2e_185fa02907fd4739/view 200 OK (6ms)
+[wrangler:info] GET /api/auth/challenge 200 OK (2ms)
+[wrangler:info] POST /api/games/game_e2e_185fa02907fd4739/moves 200 OK (16ms)
+[wrangler:info] POST /e2e/sweep 200 OK (17ms)
+[wrangler:info] GET /api/games/game_e2e_185fa02907fd4739 200 OK (2ms)
+[wrangler:info] GET /api/games/game_e2e_185fa02907fd4739/replay 200 OK (3ms)
+[wrangler:info] GET /api/leaderboards 200 OK (3ms)
+[wrangler:info] GET /api/games/game_e2e_185fa02907fd4739/events 200 OK (3ms)

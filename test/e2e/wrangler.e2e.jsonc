@@ -1,0 +1,32 @@
+{
+  // E2E wrangler config: identical bindings to the root wrangler.jsonc, but
+  // main points at the e2e shim worker (test/e2e/worker.ts), which wraps the
+  // REAL src/index.ts Worker and adds ONLY the integration glue that is not
+  // wired in this build (pairing sweep, end-of-game D1 persistence, ratings)
+  // plus a couple of test-only doors under /e2e/*. See notes/e2e-driver.md.
+  //
+  // Paths are relative to this file's directory.
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "ludus-e2e",
+  "main": "worker.ts",
+  "compatibility_date": "2026-08-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "../../web/public",
+    "binding": "ASSETS"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ludus",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "GAME_ROOM", "class_name": "GameRoom" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["GameRoom"] }],
+  "r2_buckets": [{ "binding": "REPLAYS", "bucket_name": "ludus-replays" }],
+  "kv_namespaces": [{ "binding": "CACHE", "id": "00000000000000000000000000000000" }],
+  "triggers": { "crons": ["*/5 * * * *"] }
+}

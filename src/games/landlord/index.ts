@@ -123,6 +123,13 @@ const landlord: Game<LandlordState, LandlordMove> = {
     return JSON.stringify(state);
   },
 
+  viewStateString(state, _viewer) {
+    // Deck order is the game's only hidden information (hidden from everyone,
+    // including the viewer): ship remaining-card counts in its place.
+    const { deckA, deckB, ...open } = state;
+    return JSON.stringify({ ...open, deckA_remaining: deckA.length, deckB_remaining: deckB.length });
+  },
+
   decodeState(encoded) {
     return JSON.parse(encoded) as LandlordState;
   },

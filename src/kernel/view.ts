@@ -44,6 +44,14 @@ export function buildView(game: AnyGame, state: Json, player: PlayerId, opts: Bu
   if (entries.length > maxMoves && !game.legalMovesPaged) {
     throw new Error(`${game.meta.id}: ${entries.length} legal moves exceeds ${maxMoves} and legalMovesPaged is not implemented`);
   }
+  // Hidden-information games: encodeState round-trips the FULL state (deck
+  // order, every hand), so it must never reach a live view. Ship the game's
+  // viewer-safe string instead; a hidden game without one ships no state
+  // string at all (board_text + public + private carry the playable info).
+  const stateString =
+    game.meta.information === 'hidden'
+      ? (game.viewStateString?.(state, player) ?? '')
+      : game.encodeState(state);
   return {
     game_id: opts.gameId,
     you: { player, seat: seatIndex(player) },
@@ -51,7 +59,7 @@ export function buildView(game: AnyGame, state: Json, player: PlayerId, opts: Bu
     phase: opts.phase,
     deadline_utc: opts.deadlineUtc,
     board_text: game.renderText(state, player),
-    state_string: game.encodeState(state),
+    state_string: stateString,
     public: game.publicView(state),
     private: game.privateView(state, player),
     legal_moves: entries.slice(0, maxMoves),

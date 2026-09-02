@@ -207,6 +207,16 @@ export interface Game<S extends Json = Json, M extends Json = Json> {
    * When absent the room applies a seeded random legal move.
    */
   defaultMove?(state: S, player: PlayerId, legal: M[]): M;
+
+  /**
+   * Viewer-safe compact state string for hidden-information games. REQUIRED
+   * when meta.information === 'hidden': encodeState round-trips the FULL state
+   * (decks, hands) for replays and codecs, so buildView must never ship it to
+   * a seated player mid-game — it ships this instead, which may include the
+   * viewer's own hidden information but nobody else's and no deck order.
+   * (Red-team finding F1: state_string leaked all hidden state live.)
+   */
+  viewStateString?(state: S, viewer: PlayerId): string;
 }
 
 /** Type-erased game for the registry, rooms, and API. */

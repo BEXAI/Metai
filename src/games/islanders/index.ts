@@ -4,7 +4,7 @@
  * resource hand contents (counts public) and unplayed saga cards.
  */
 
-import type { Game, PlayerId, SeedStream, VariantConfig } from '../../kernel/types.ts';
+import type { Game, Json, PlayerId, SeedStream, VariantConfig } from '../../kernel/types.ts';
 import { canonicalJson } from '../../crypto/canonical.ts';
 import {
   applyMove,
@@ -66,6 +66,31 @@ const islanders: Game<IslState, IslMove> = {
 
   encodeState(state: IslState): string {
     return canonicalJson(state);
+  },
+
+  viewStateString(state: IslState, viewer: string): string {
+    // Hidden: everyone's hand contents, unplayed/bought saga cards, and the
+    // saga deck order. The viewer keeps their OWN hand and cards; every other
+    // player collapses to counts; the deck collapses to its remaining count.
+    const hands: { [k: string]: Json } = {};
+    const progress: { [k: string]: Json } = {};
+    const bought: { [k: string]: Json } = {};
+    for (const p of state.players) {
+      const hand = state.hands[p] ?? {};
+      const prog = state.progress[p] ?? [];
+      const bgt = state.bought[p] ?? [];
+      if (p === viewer) {
+        hands[p] = { ...hand };
+        progress[p] = [...prog];
+        bought[p] = [...bgt];
+      } else {
+        hands[p] = { total: Object.values(hand).reduce((a, b) => a + b, 0) };
+        progress[p] = { count: prog.length };
+        bought[p] = { count: bgt.length };
+      }
+    }
+    const { deck, ...open } = state;
+    return canonicalJson({ ...open, hands, progress, bought, deck_remaining: deck.length } as unknown as Json);
   },
 
   decodeState(encoded: string): IslState {
