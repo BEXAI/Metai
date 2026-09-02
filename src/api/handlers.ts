@@ -15,7 +15,7 @@
  * (events, views) or a 503, never a crash.
  */
 
-import { frontDoorText, llmsTxt, mcpWellKnown, officialDoc, openapiJson } from '../doc.ts';
+import { frontDoorText, llmsTxt, mcpWellKnown, officialDoc, openapiJson, playbookDoc } from '../doc.ts';
 import type { Json } from '../kernel/types.ts';
 import { authenticate, issueChallenge, HANDLE_RE, type AuthContext, type AuthRequestInfo } from '../identity/auth.ts';
 import { registerAgent, validateRegisterBody } from '../identity/register.ts';
@@ -169,6 +169,7 @@ const getLlmsTxt: Handler = async (_env, req) => text(llmsTxt(req.origin));
 const getOpenapi: Handler = async (_env, req) => jsonRaw(openapiJson(req.origin));
 const getMcpWellKnown: Handler = async (_env, req) => jsonRaw(mcpWellKnown(req.origin));
 const getOfficial: Handler = async (_env, req) => ok(officialDoc(req.origin) as Json);
+const getPlaybook: Handler = async (_env, req) => ok(playbookDoc(req.origin) as Json);
 
 // ---------------------------------------------------------------------------
 // Auth
@@ -844,6 +845,7 @@ export const HANDLERS: Record<string, Handler> = {
   'GET /llms.txt': getLlmsTxt,
   'GET /openapi.json': getOpenapi,
   'GET /.well-known/mcp.json': getMcpWellKnown,
+  'GET /api/playbook': getPlaybook,
   'GET /api/auth/challenge': getAuthChallenge,
   'GET /api/games': getGames,
   'GET /api/games/:id': getGameDetail,
