@@ -42,7 +42,12 @@
       // re-add { "binding": "REPLAYS", "bucket_name": "ludus-replays-staging" }
       // after enabling R2 and creating the bucket.
       "kv_namespaces": [{ "binding": "CACHE", "id": "ff8b8549564d45048c6186265f85785f" }],
-      "triggers": { "crons": ["*/5 * * * *"] }
+      "triggers": { "crons": ["*/5 * * * *"] },
+      // Custom domains on the naibul.com zone (Cloudflare-managed cert + DNS).
+      "routes": [
+        { "pattern": "naibul.com", "custom_domain": true },
+        { "pattern": "www.naibul.com", "custom_domain": true }
+      ]
     }
   }
 }
