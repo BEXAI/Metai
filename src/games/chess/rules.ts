@@ -337,22 +337,25 @@ export function genPseudo(pos: Pos): number[] {
       }
     }
   }
-  // Castling: rights bit, empty between, king not in / through / into check.
+  // Castling: rights bit, king AND rook on their home squares, empty between,
+  // king not in / through / into check. The home-square checks defend against
+  // crafted states whose castling field disagrees with the board (a right can
+  // never be exercised with a phantom rook / displaced king).
   if (us === 0) {
-    if ((pos.castling & 1) !== 0 && b[26] === EMPTY && b[27] === EMPTY &&
+    if ((pos.castling & 1) !== 0 && b[25] === WK && b[28] === WR && b[26] === EMPTY && b[27] === EMPTY &&
         !attacked(pos, 25, 1) && !attacked(pos, 26, 1) && !attacked(pos, 27, 1)) {
       out.push(mv(25, 27));
     }
-    if ((pos.castling & 2) !== 0 && b[24] === EMPTY && b[23] === EMPTY && b[22] === EMPTY &&
+    if ((pos.castling & 2) !== 0 && b[25] === WK && b[21] === WR && b[24] === EMPTY && b[23] === EMPTY && b[22] === EMPTY &&
         !attacked(pos, 25, 1) && !attacked(pos, 24, 1) && !attacked(pos, 23, 1)) {
       out.push(mv(25, 23));
     }
   } else {
-    if ((pos.castling & 4) !== 0 && b[96] === EMPTY && b[97] === EMPTY &&
+    if ((pos.castling & 4) !== 0 && b[95] === BK && b[98] === BR && b[96] === EMPTY && b[97] === EMPTY &&
         !attacked(pos, 95, 0) && !attacked(pos, 96, 0) && !attacked(pos, 97, 0)) {
       out.push(mv(95, 97));
     }
-    if ((pos.castling & 8) !== 0 && b[94] === EMPTY && b[93] === EMPTY && b[92] === EMPTY &&
+    if ((pos.castling & 8) !== 0 && b[95] === BK && b[91] === BR && b[94] === EMPTY && b[93] === EMPTY && b[92] === EMPTY &&
         !attacked(pos, 95, 0) && !attacked(pos, 94, 0) && !attacked(pos, 93, 0)) {
       out.push(mv(95, 93));
     }

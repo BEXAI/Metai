@@ -100,6 +100,8 @@ interface CreateBody {
   drand_round: number;
   drand_randomness: string;
   per_move_ms?: number;
+  /** Cumulative per-side clock budget, ms; null disables. Omitted = the game's spec default. */
+  per_side_ms?: number | null;
   clock_scale?: number;
   rules_card?: string;
 }
@@ -217,6 +219,7 @@ export class GameRoom {
       drandRandomnessHex: body.drand_randomness,
     };
     if (body.per_move_ms !== undefined) params.perMoveMs = body.per_move_ms;
+    if (body.per_side_ms !== undefined) params.perSideMs = body.per_side_ms;
     if (body.clock_scale !== undefined) params.clockScale = body.clock_scale;
     if (body.rules_card !== undefined) params.rulesCard = body.rules_card;
 
@@ -240,8 +243,17 @@ export class GameRoom {
     if (typeof body.agent_id !== 'string' || typeof body.signature !== 'string' || body.submission == null) {
       return errorJson(400, 'bad_request', 'agent_id, submission, and signature are required');
     }
-    const result = core.submitMove(Date.now(), body.agent_id, body.submission, body.signature);
+    const now = Date.now();
+    // DO alarms are at-least-once and can lag: resolve an expired deadline
+    // BEFORE the submission so a late move can never land as a clean move for
+    // the expired turn (the core also rejects late moves as a second guard).
+    const expired = core.timeout(now);
+    const result = core.submitMove(now, body.agent_id, body.submission, body.signature);
     await this.persist(core);
+    if (expired.fired) {
+      this.broadcast(expired.events);
+      if (expired.ended) await this.uploadReplay(core);
+    }
     if (result.ok) {
       this.broadcast(result.events);
       if (result.ended) await this.uploadReplay(core);

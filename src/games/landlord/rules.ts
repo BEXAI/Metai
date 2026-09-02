@@ -892,6 +892,11 @@ function advanceTurn(st: LandlordState): void {
 // ---------------------------------------------------------------------------
 
 function validBundleShape(b: Bundle): string | null {
+  // Hostile move bodies can reach apply() with anything here — a missing /
+  // null / non-object bundle must become a structured rejection, not a throw.
+  if (typeof b !== 'object' || b === null || Array.isArray(b)) {
+    return 'bundle must be an object with cash, props, and writs';
+  }
   if (!Number.isInteger(b.cash) || b.cash < 0) return 'bundle cash must be a non-negative integer';
   if (!Number.isInteger(b.writs) || b.writs < 0) return 'bundle writs must be a non-negative integer';
   if (!Array.isArray(b.props)) return 'bundle props must be an array';
@@ -924,6 +929,9 @@ function validateOfferSides(st: LandlordState, o: OfferState): string | null {
   if (o.give.cash === 0 && o.give.props.length === 0 && o.give.writs === 0 && o.get.cash === 0 && o.get.props.length === 0 && o.get.writs === 0) {
     return 'offer is empty';
   }
+  // The note is TEXT capped at MAX_NOTE_CHARS: a non-string (number, object,
+  // missing field) must not slip past the cap via `.length === undefined`.
+  if (o.note !== null && typeof o.note !== 'string') return 'note must be a string or null';
   if (o.note !== null && o.note.length > MAX_NOTE_CHARS) return `note exceeds ${MAX_NOTE_CHARS} characters`;
   return null;
 }

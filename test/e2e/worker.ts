@@ -52,6 +52,7 @@ import {
   type Standing,
 } from '../../src/match/glicko2.ts';
 import { sha256Hex } from '../../src/crypto/canonical.ts';
+import { roundAt } from '../../src/crypto/drand.ts';
 import { playerId, type GameResult, type Json } from '../../src/kernel/types.ts';
 
 export { GameRoom } from '../../src/index.ts';
@@ -176,8 +177,11 @@ function e2eGameFactory(env: WorkerEnv, cfg: E2eConfig): GameFactory {
       const perMoveMs = cfg.per_move_ms_by_game?.[cmd.game] ?? cfg.per_move_ms ?? 60_000;
       // Local pseudo-drand: offline-deterministic; verify-replay checks the
       // recorded round+randomness structurally (it cannot re-fetch drand
-      // offline anyway). Recorded in notes/e2e-driver.md.
-      const drandRound = 1;
+      // offline anyway). Recorded in notes/e2e-driver.md. The round must be
+      // at or after the commitment time (spec randomness[1], enforced by
+      // RoomCore.create), so pick a round safely after "now" (+100 rounds =
+      // 5 minutes of margin between this sweep and the DO's own Date.now()).
+      const drandRound = roundAt(Date.now()) + 100;
       const drandRandomness = sha256Hex(`e2e-drand:${gameId}`);
       const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(gameId));
       const createRes = await stub.fetch('https://room/create', {

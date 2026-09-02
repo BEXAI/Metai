@@ -138,10 +138,30 @@ describe('bar priority', () => {
 
 describe('bear-off legality', () => {
   it('no bear-off while any checker is outside the home board', () => {
-    const st = craft({ dice: [6, 5], points: { 7: 1, 6: 2, 5: 2, 4: 2, 3: 2, 2: 2, 1: 4, 24: -2, 13: -5, 19: -8 } });
+    // The straggler on 13 cannot reach home with either die (13-6=7, 13-5=8),
+    // so NO legal turn may contain a bear-off hop. (If the straggler could
+    // come home mid-turn, bearing off with the remaining die would be legal —
+    // that variant is covered below.)
+    const st = craft({ dice: [6, 5], points: { 13: 1, 6: 2, 5: 2, 4: 2, 3: 2, 2: 2, 1: 3, 24: -2, 19: -8, 12: -5 } });
     for (const m of turns(st)) for (const h of hopsOf(m)) expect(h.to).not.toBe(0);
-    const cheat = bg.apply(st, 'p0', { hops: [{ from: 6, to: 0, die: 6 }, { from: 7, to: 2, die: 5 }] }, seed());
+    const cheat = bg.apply(st, 'p0', { hops: [{ from: 6, to: 0, die: 6 }, { from: 13, to: 8, die: 5 }] }, seed());
     expect(isRuleError(cheat)).toBe(true);
+  });
+
+  it('a straggler that comes home mid-turn unlocks bear-off for the SECOND die only', () => {
+    // Checker on 7 with dice 6-5: 7/1 (6) brings everything home, then 5/off
+    // is legal. But bearing off FIRST (before the straggler is home) is not.
+    const st = craft({ dice: [6, 5], points: { 7: 1, 6: 2, 5: 2, 4: 2, 3: 2, 2: 2, 1: 4, 24: -2, 13: -5, 19: -8 } });
+    const withOff = turns(st).filter((m) => hopsOf(m).some((h) => h.to === 0));
+    expect(withOff.length).toBeGreaterThan(0);
+    for (const m of withOff) {
+      // in every such turn the 7-point hop precedes the bear-off
+      const hs = hopsOf(m);
+      const homeIdx = hs.findIndex((h) => h.from === 7);
+      const offIdx = hs.findIndex((h) => h.to === 0);
+      expect(homeIdx).toBeGreaterThanOrEqual(0);
+      expect(homeIdx).toBeLessThan(offIdx);
+    }
   });
 
   it('no bear-off while a checker sits on the bar (even with the rest home)', () => {

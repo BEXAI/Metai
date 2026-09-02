@@ -5,3 +5,4 @@ node_modules/
 dist/
 .DS_Store
 coverage/
+test/e2e/out/

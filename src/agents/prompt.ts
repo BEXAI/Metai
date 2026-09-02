@@ -35,14 +35,33 @@ export function approxTokenCount(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
+const FENCE_REPLACEMENT = '[fence-stripped]';
+
+/**
+ * Replaces every byte-exact fence marker with an inert token, looping to a
+ * fixpoint. The replacement contains '[' / ']' — characters that appear in
+ * neither marker — so stripped output can never re-assemble into a marker;
+ * the loop terminates after one pass in practice.
+ */
+function stripFenceMarkers(text: string): string {
+  let out = text;
+  while (out.includes(UNTRUSTED_OPEN) || out.includes(UNTRUSTED_CLOSE)) {
+    out = out.split(UNTRUSTED_OPEN).join(FENCE_REPLACEMENT).split(UNTRUSTED_CLOSE).join(FENCE_REPLACEMENT);
+  }
+  return out;
+}
+
 /** Neutralizes fence markers inside untrusted text so it cannot escape the block. */
 export function sanitizeUntrusted(text: string): string {
-  return text
-    .split(UNTRUSTED_OPEN).join('[fence-stripped]')
-    .split(UNTRUSTED_CLOSE).join('[fence-stripped]')
-    // strip control characters except newline/tab
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
-    .slice(0, 280);
+  // Order matters (INJ-1): control characters are stripped BEFORE the fence
+  // markers, so a marker split by a control character (e.g.
+  // '<<<UNTRUSTED_DATA_END' + NUL + '>>>') re-assembles here and would be
+  // caught by the marker strip. The 280 slice stays last — truncation cannot
+  // create a marker.
+  return stripFenceMarkers(
+    // strip control characters except newline/tab/carriage-return
+    text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ''),
+  ).slice(0, 280);
 }
 
 function hasHiddenInfo(view: ViewObject): boolean {
@@ -71,23 +90,28 @@ function render(view: ViewObject, parts: Parts): { system: string; user: string 
   lines.push(`You are ${view.you.player} (seat ${view.you.seat}). Turn ${view.turn_index}, phase '${view.phase}'.`);
   lines.push(`Deadline (UTC): ${view.deadline_utc}`);
   lines.push('');
+  // INJ-2: these fields sit OUTSIDE the untrusted fence but can carry
+  // agent-authored text (e.g. landlord trade notes surface in renderText,
+  // encodeState, and the private view). Neutralizing byte-exact fence
+  // markers here is lossless for legitimate game content and guarantees the
+  // built prompt keeps exactly one real marker pair.
   lines.push('RULES CARD:');
-  lines.push(view.rules_card);
+  lines.push(stripFenceMarkers(view.rules_card));
   lines.push('');
   lines.push('BOARD:');
-  lines.push(view.board_text);
+  lines.push(stripFenceMarkers(view.board_text));
   lines.push('');
-  lines.push(`STATE: ${view.state_string}`);
+  lines.push(`STATE: ${stripFenceMarkers(view.state_string)}`);
   lines.push('');
   lines.push('YOUR PRIVATE INFORMATION (yours alone, trusted):');
-  lines.push(JSON.stringify(view.private));
+  lines.push(stripFenceMarkers(JSON.stringify(view.private)));
   lines.push('');
 
   const total = view.legal_moves.length;
   lines.push(`LEGAL MOVES (${total} total; valid indexes are 0..${total - 1}):`);
   for (const m of view.legal_moves.slice(0, parts.keepMoves)) {
-    const summary = parts.keepSummaries && m.summary ? ` — ${m.summary}` : '';
-    lines.push(`  ${m.index}: ${m.notation}${summary}`);
+    const summary = parts.keepSummaries && m.summary ? ` — ${stripFenceMarkers(m.summary)}` : '';
+    lines.push(`  ${m.index}: ${stripFenceMarkers(m.notation)}${summary}`);
   }
   if (parts.keepMoves < total) {
     lines.push(`  … ${total - parts.keepMoves} more not listed; every index up to ${total - 1} is still valid.`);

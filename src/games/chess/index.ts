@@ -28,9 +28,13 @@ import {
 import { normalizeUci, uciOfMove } from './notation.ts';
 import { renderChess } from './render.ts';
 import {
+  BK,
+  BR,
   EMPTY,
   P,
   START_FEN,
+  WK,
+  WR,
   colorOf,
   epCaptureLegal,
   fenBoardField,
@@ -102,6 +106,17 @@ function decode(encoded: string): ChessState {
   const pos = posFromFen(rest); // validates board, kings, clocks, ep square
   // Normalize ep the FIDE way: keep it only when a legal ep capture exists.
   if (pos.ep >= 0 && !epCaptureLegal(pos)) pos.ep = -1;
+  // Normalize castling rights the same way: a right exists only while the
+  // king and the matching rook still sit on their home squares. Masking here
+  // (never adding) keeps crafted FENs from claiming phantom-rook castles and
+  // keeps repetition keys canonical.
+  const cb = pos.board;
+  if (cb[25] !== WK) pos.castling &= ~3; // white king off e1: both white rights
+  if (cb[28] !== WR) pos.castling &= ~1; // no rook on h1: K
+  if (cb[21] !== WR) pos.castling &= ~2; // no rook on a1: Q
+  if (cb[95] !== BK) pos.castling &= ~12; // black king off e8: both black rights
+  if (cb[98] !== BR) pos.castling &= ~4; // no rook on h8: k
+  if (cb[91] !== BR) pos.castling &= ~8; // no rook on a8: q
 
   const st = stateFromPos(pos, null, null, null); // reps = { currentKey: 1 }
 

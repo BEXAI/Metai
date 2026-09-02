@@ -347,6 +347,10 @@ function msEntries(ms: Multiset): [Resource, number][] {
 }
 
 function validMultiset(ms: Multiset): boolean {
+  // Hostile move bodies can reach apply() with anything here (missing field,
+  // null, a number, an array) — that must be a structured rejection upstream,
+  // never a thrown TypeError from Object.keys(null/undefined).
+  if (typeof ms !== 'object' || ms === null || Array.isArray(ms)) return false;
   const keys = Object.keys(ms);
   if (keys.length === 0) return false;
   for (const k of keys) {

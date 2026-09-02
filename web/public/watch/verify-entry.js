@@ -2358,11 +2358,22 @@ function resolveMove(game5, state, player, payload, sub) {
   const raw = sub.move;
   let move;
   if (typeof raw === "string") {
-    const parsed = game5.parseMove(raw, state, player);
-    if (isParseError(parsed)) {
-      return { ok: false, detail: `submission notation '${raw}' did not parse: ${parsed.message}` };
+    const hashIdx = /^#(\d+)$/.exec(raw.trim());
+    if (hashIdx) {
+      const idx = Number(hashIdx[1]);
+      const legal = game5.legalMoves(state, player);
+      const picked = legal[idx];
+      if (picked === void 0) {
+        return { ok: false, detail: `submission index #${idx} out of range (${legal.length} legal moves)` };
+      }
+      move = picked;
+    } else {
+      const parsed = game5.parseMove(raw, state, player);
+      if (isParseError(parsed)) {
+        return { ok: false, detail: `submission notation '${raw}' did not parse: ${parsed.message}` };
+      }
+      move = parsed;
     }
-    move = parsed;
   } else {
     const idxObj = asObj(raw);
     if (!idxObj || typeof idxObj.index !== "number") {
@@ -2520,14 +2531,26 @@ function verifyReplay(replay, games) {
         if (!sub) return `entry ${e.seq}: payload.submission missing`;
         if (sub.game_id !== replay.game_id) return `entry ${e.seq}: submission.game_id != replay.game_id`;
         if (sub.turn_index !== turn) return `entry ${e.seq}: submission.turn_index != payload.turn_index`;
-        const r = resolveMove(game5, state, player, p, sub);
-        if (!r.ok) return `entry ${e.seq}: ${r.detail}`;
-        move = r.move;
+        if (p.forced !== void 0 && p.forced !== "illegal") {
+          return `entry ${e.seq}: unknown forced marker ${JSON.stringify(p.forced)}`;
+        }
+        if (p.forced === "illegal") {
+          const legal = game5.legalMoves(state, player);
+          if (legal.length === 0) return `entry ${e.seq}: forced move for ${player} but no legal moves exist`;
+          move = legal[seed.int(`illegal:turn:${turn}`, legal.length)];
+        } else {
+          const r = resolveMove(game5, state, player, p, sub);
+          if (!r.ok) return `entry ${e.seq}: ${r.detail}`;
+          move = r.move;
+        }
       } else {
-        const purpose = typeof p.purpose === "string" ? p.purpose : `timeout:turn:${turn}`;
+        const purpose = `timeout:turn:${turn}`;
+        if (p.purpose !== void 0 && p.purpose !== purpose) {
+          return `entry ${e.seq}: timeout purpose ${JSON.stringify(p.purpose)} != frozen '${purpose}'`;
+        }
         const legal = game5.legalMoves(state, player);
         if (legal.length === 0) return `entry ${e.seq}: timeout for ${player} but no legal moves exist`;
-        if (game5.defaultMove && !purpose.startsWith("illegal:")) {
+        if (game5.defaultMove) {
           move = game5.defaultMove(state, player, legal);
         } else {
           move = legal[seed.int(purpose, legal.length)];
@@ -3262,17 +3285,17 @@ function genPseudo(pos) {
     }
   }
   if (us === 0) {
-    if ((pos.castling & 1) !== 0 && b[26] === EMPTY && b[27] === EMPTY && !attacked(pos, 25, 1) && !attacked(pos, 26, 1) && !attacked(pos, 27, 1)) {
+    if ((pos.castling & 1) !== 0 && b[25] === WK && b[28] === WR && b[26] === EMPTY && b[27] === EMPTY && !attacked(pos, 25, 1) && !attacked(pos, 26, 1) && !attacked(pos, 27, 1)) {
       out.push(mv(25, 27));
     }
-    if ((pos.castling & 2) !== 0 && b[24] === EMPTY && b[23] === EMPTY && b[22] === EMPTY && !attacked(pos, 25, 1) && !attacked(pos, 24, 1) && !attacked(pos, 23, 1)) {
+    if ((pos.castling & 2) !== 0 && b[25] === WK && b[21] === WR && b[24] === EMPTY && b[23] === EMPTY && b[22] === EMPTY && !attacked(pos, 25, 1) && !attacked(pos, 24, 1) && !attacked(pos, 23, 1)) {
       out.push(mv(25, 23));
     }
   } else {
-    if ((pos.castling & 4) !== 0 && b[96] === EMPTY && b[97] === EMPTY && !attacked(pos, 95, 0) && !attacked(pos, 96, 0) && !attacked(pos, 97, 0)) {
+    if ((pos.castling & 4) !== 0 && b[95] === BK && b[98] === BR && b[96] === EMPTY && b[97] === EMPTY && !attacked(pos, 95, 0) && !attacked(pos, 96, 0) && !attacked(pos, 97, 0)) {
       out.push(mv(95, 97));
     }
-    if ((pos.castling & 8) !== 0 && b[94] === EMPTY && b[93] === EMPTY && b[92] === EMPTY && !attacked(pos, 95, 0) && !attacked(pos, 94, 0) && !attacked(pos, 93, 0)) {
+    if ((pos.castling & 8) !== 0 && b[95] === BK && b[91] === BR && b[94] === EMPTY && b[93] === EMPTY && b[92] === EMPTY && !attacked(pos, 95, 0) && !attacked(pos, 94, 0) && !attacked(pos, 93, 0)) {
       out.push(mv(95, 93));
     }
   }
@@ -3615,6 +3638,13 @@ function decode(encoded) {
   }
   const pos = posFromFen(rest);
   if (pos.ep >= 0 && !epCaptureLegal(pos)) pos.ep = -1;
+  const cb = pos.board;
+  if (cb[25] !== WK) pos.castling &= ~3;
+  if (cb[28] !== WR) pos.castling &= ~1;
+  if (cb[21] !== WR) pos.castling &= ~2;
+  if (cb[95] !== BK) pos.castling &= ~12;
+  if (cb[98] !== BR) pos.castling &= ~4;
+  if (cb[91] !== BR) pos.castling &= ~8;
   const st = stateFromPos(pos, null, null, null);
   if (repsSeg !== null) {
     const reps = {};
@@ -7816,6 +7846,9 @@ function advanceTurn(st) {
   st.afterPipeline = "manage";
 }
 function validBundleShape(b) {
+  if (typeof b !== "object" || b === null || Array.isArray(b)) {
+    return "bundle must be an object with cash, props, and writs";
+  }
   if (!Number.isInteger(b.cash) || b.cash < 0) return "bundle cash must be a non-negative integer";
   if (!Number.isInteger(b.writs) || b.writs < 0) return "bundle writs must be a non-negative integer";
   if (!Array.isArray(b.props)) return "bundle props must be an array";
@@ -7847,6 +7880,7 @@ function validateOfferSides(st, o) {
   if (o.give.cash === 0 && o.give.props.length === 0 && o.give.writs === 0 && o.get.cash === 0 && o.get.props.length === 0 && o.get.writs === 0) {
     return "offer is empty";
   }
+  if (o.note !== null && typeof o.note !== "string") return "note must be a string or null";
   if (o.note !== null && o.note.length > MAX_NOTE_CHARS) return `note exceeds ${MAX_NOTE_CHARS} characters`;
   return null;
 }
@@ -8397,6 +8431,10 @@ var landlord = {
   encodeState(state) {
     return JSON.stringify(state);
   },
+  viewStateString(state, _viewer) {
+    const { deckA, deckB, ...open } = state;
+    return JSON.stringify({ ...open, deckA_remaining: deckA.length, deckB_remaining: deckB.length });
+  },
   decodeState(encoded) {
     return JSON.parse(encoded);
   },
@@ -8640,6 +8678,7 @@ function msEntries(ms) {
   return out;
 }
 function validMultiset(ms) {
+  if (typeof ms !== "object" || ms === null || Array.isArray(ms)) return false;
   const keys = Object.keys(ms);
   if (keys.length === 0) return false;
   for (const k of keys) {
@@ -9959,6 +9998,27 @@ var islanders = {
   renderText,
   encodeState(state) {
     return canonicalJson(state);
+  },
+  viewStateString(state, viewer) {
+    const hands = {};
+    const progress = {};
+    const bought = {};
+    for (const p of state.players) {
+      const hand = state.hands[p] ?? {};
+      const prog = state.progress[p] ?? [];
+      const bgt = state.bought[p] ?? [];
+      if (p === viewer) {
+        hands[p] = { ...hand };
+        progress[p] = [...prog];
+        bought[p] = [...bgt];
+      } else {
+        hands[p] = { total: Object.values(hand).reduce((a, b) => a + b, 0) };
+        progress[p] = { count: prog.length };
+        bought[p] = { count: bgt.length };
+      }
+    }
+    const { deck, ...open } = state;
+    return canonicalJson({ ...open, hands, progress, bought, deck_remaining: deck.length });
   },
   decodeState(encoded) {
     const parsed = JSON.parse(encoded);

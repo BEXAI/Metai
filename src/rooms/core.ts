@@ -30,6 +30,7 @@ import { bytesToHex } from '@noble/hashes/utils';
 import { hashJson } from '../crypto/canonical.ts';
 import { appendEntry } from '../crypto/chain.ts';
 import { deriveFinalSeed, makeCommitment } from '../crypto/commit.ts';
+import { roundTimeMs } from '../crypto/drand.ts';
 import { verifyEd25519 } from '../crypto/ed25519.ts';
 import { hashState } from '../kernel/hash.ts';
 import {
@@ -84,11 +85,25 @@ export interface RoomSeat {
 
 export interface RoomClocks {
   perMoveMs: number;
+  /**
+   * Cumulative side budget, ms (spec games.*.clock, e.g. chess "40 min per
+   * side cumulative"); null = uncapped. Scaled by clock_scale like perMoveMs.
+   */
+  perSideMs: number | null;
   /** Test override multiplier (1 in production); see PLAN.md frozen policy. */
   clock_scale: number;
   /** Total thinking time consumed per seat, ms. */
   cumulativeMs: Record<PlayerId, number>;
 }
+
+/**
+ * Per-game cumulative side budgets frozen by the spec's games.*.clock lines
+ * (chess: "60 s per move, 40 min per side cumulative"). Games with no spec'd
+ * side budget are uncapped unless the creator passes perSideMs explicitly.
+ */
+const DEFAULT_PER_SIDE_MS: Record<string, number> = {
+  chess: 40 * 60_000,
+};
 
 export interface CreateRoomParams {
   /** Unique id of this game session (room id, log id, replay id). */
@@ -103,6 +118,11 @@ export interface CreateRoomParams {
   drandRound: number;
   drandRandomnessHex: string;
   perMoveMs?: number;
+  /**
+   * Cumulative per-side clock budget, ms; null disables the cap. Omitted =
+   * the game's spec default (DEFAULT_PER_SIDE_MS; chess 40 min, else null).
+   */
+  perSideMs?: number | null;
   clockScale?: number;
   rulesCard?: string;
 }
@@ -226,6 +246,19 @@ export class RoomCore {
       if (seat.player !== `p${i}`) throw new Error(`createRoom: seat ${i} must be player p${i}, got ${seat.player}`);
     }
 
+    // Spec §identity_and_integrity.randomness[1]: the mixed drand quicknet
+    // round must be at or after the commitment time. A round whose randomness
+    // was already public when the commitment is made would let the house
+    // grind the secret against known randomness for a favorable final_seed —
+    // and created_at is not offline-verifiable, so create time is the only
+    // place this ordering can be enforced.
+    if (roundTimeMs(params.drandRound) < nowMs) {
+      throw new Error(
+        `createRoom: drand round ${params.drandRound} was emitted at ${roundTimeMs(params.drandRound)}ms, ` +
+          `before the commitment time ${nowMs}ms — the mixed round must be at or after the commitment`,
+      );
+    }
+
     const commitment = makeCommitment(gameId, params.secretHex);
     const finalSeed = deriveFinalSeed(gameId, params.secretHex, params.drandRandomnessHex);
     const seed = createSeedStream(finalSeed);
@@ -235,8 +268,11 @@ export class RoomCore {
 
     const perMoveMs = params.perMoveMs ?? 60_000;
     const clockScale = params.clockScale ?? 1;
+    const perSideMs =
+      params.perSideMs !== undefined ? params.perSideMs : DEFAULT_PER_SIDE_MS[game.meta.id] ?? null;
     const clocks: RoomClocks = {
       perMoveMs,
+      perSideMs,
       clock_scale: clockScale,
       cumulativeMs: Object.fromEntries(players.map((p) => [p, 0])),
     };
@@ -314,6 +350,23 @@ export class RoomCore {
   static hydrate(game: AnyGame, snapshot: RoomSnapshot): RoomCore {
     if (game.meta.id !== snapshot.game) {
       throw new Error(`hydrate: snapshot is for game '${snapshot.game}', got '${game.meta.id}'`);
+    }
+    // Re-derive the commit-reveal binding before trusting the snapshot: a
+    // room resumed on a mismatched secret/commitment/final_seed would finish
+    // the game and publish a replay that can never verify (gate A8). Any
+    // storage-level tampering or corruption must hard-fail here instead.
+    const commitment = makeCommitment(snapshot.game_id, snapshot.secret);
+    if (commitment !== snapshot.commitment) {
+      throw new Error('hydrate: snapshot commitment does not re-derive from (game_id, secret)');
+    }
+    const finalSeed = deriveFinalSeed(snapshot.game_id, snapshot.secret, snapshot.drand_randomness);
+    if (finalSeed !== snapshot.final_seed) {
+      throw new Error('hydrate: snapshot final_seed does not re-derive from (game_id, secret, drand_randomness)');
+    }
+    // Snapshots persisted before the cumulative side clock existed lack
+    // clocks.perSideMs — resume them under the game's spec default.
+    if ((snapshot.clocks as Partial<RoomClocks>).perSideMs === undefined) {
+      snapshot.clocks.perSideMs = DEFAULT_PER_SIDE_MS[game.meta.id] ?? null;
     }
     const seed = createSeedStream(snapshot.final_seed);
     // Fast-forward the stream by replaying every recorded draw; any mismatch
@@ -469,9 +522,37 @@ export class RoomCore {
     return Math.max(1, Math.round(this.snap.clocks.perMoveMs * this.snap.clocks.clock_scale));
   }
 
+  /** Scaled cumulative side budget (spec games.*.clock), or null when uncapped. */
+  private sideBudgetMs(): number | null {
+    const per = this.snap.clocks.perSideMs;
+    return per === null ? null : Math.max(1, Math.round(per * this.snap.clocks.clock_scale));
+  }
+
+  /** True when the player's cumulative thinking time exhausted the side budget. */
+  private flagFallen(player: PlayerId): boolean {
+    const budget = this.sideBudgetMs();
+    return budget !== null && (this.snap.clocks.cumulativeMs[player] ?? 0) >= budget;
+  }
+
   private startTurnClock(nowMs: number): void {
     this.snap.turnStartedAtMs = nowMs;
-    this.snap.deadlineAtMs = this.snap.status === 'running' ? nowMs + this.budgetMs() : null;
+    if (this.snap.status !== 'running') {
+      this.snap.deadlineAtMs = null;
+      return;
+    }
+    // The turn allowance is the per-move budget shrunk to whatever remains of
+    // each mover's cumulative side budget (spec games.chess.clock: "60 s per
+    // move, 40 min per side cumulative") — a mover can never think past their
+    // flag inside a single move clock.
+    let allowance = this.budgetMs();
+    const side = this.sideBudgetMs();
+    if (side !== null) {
+      for (const p of this.game.playersToMove(this.snap.state)) {
+        const remaining = side - (this.snap.clocks.cumulativeMs[p] ?? 0);
+        allowance = Math.min(allowance, Math.max(1, remaining));
+      }
+    }
+    this.snap.deadlineAtMs = nowMs + allowance;
   }
 
   private reject(nowMs: number, agentId: string, code: string, message: string, extra?: Partial<SubmitReject>): SubmitReject {
@@ -533,6 +614,18 @@ export class RoomCore {
       const winners = this.snap.seats.map((s) => s.player).filter((p) => p !== player);
       this.endGame(nowMs, { winners, draw: false, reason: 'resignation' });
       return this.okResult(evStart, true);
+    }
+
+    // The view contract fixes deadline_utc as the "ISO time by which the move
+    // must arrive". DO alarms are at-least-once and can lag, so a submission
+    // landing at/after the deadline must never count as a clean move for the
+    // expired turn — it is rejected and the turn resolves through timeout()
+    // (GameRoom runs the timeout check before forwarding submissions).
+    if (this.snap.deadlineAtMs !== null && nowMs >= this.snap.deadlineAtMs) {
+      return this.reject(
+        nowMs, agentId, 'deadline_passed',
+        `the deadline for turn ${this.snap.turnIndex} passed at ${iso(this.snap.deadlineAtMs)}; the turn resolves by timeout`,
+      );
     }
 
     const movers = this.playersToMoveNow();
@@ -653,6 +746,15 @@ export class RoomCore {
       const outcome = this.illegalAttempt(nowMs, seat, resolved.illegal);
       if ('rejection' in outcome) return outcome.rejection;
       // Third illegal attempt this turn: seeded random legal move + strike.
+      // When that strike is the player's THIRD, the forfeit beats the forced
+      // move (spec: "Three strikes in a game forfeit it") — nothing is drawn
+      // or applied, matching the simultaneous path, so a striker can never be
+      // crowned by their own forced game-ending move.
+      if ((this.snap.strikes[player] ?? 0) >= 2) {
+        this.recordStrike(nowMs, player, 'illegal_move', this.snap.turnIndex);
+        this.forfeit(nowMs, player);
+        return this.okResult(evStart, true);
+      }
       drawStart = this.seed.draws().length;
       move = this.drawForcedLegal(player, this.snap.turnIndex);
       forced = true;
@@ -665,6 +767,12 @@ export class RoomCore {
       if (forced) throw new Error(`room ${this.snap.game_id}: forced random legal move rejected: ${applied.message}`);
       const outcome = this.illegalAttempt(nowMs, seat, `${applied.code}: ${applied.message}`);
       if ('rejection' in outcome) return outcome.rejection;
+      // Same third-strike rule as above: forfeit beats the forced move.
+      if ((this.snap.strikes[player] ?? 0) >= 2) {
+        this.recordStrike(nowMs, player, 'illegal_move', this.snap.turnIndex);
+        this.forfeit(nowMs, player);
+        return this.okResult(evStart, true);
+      }
       drawStart = this.seed.draws().length;
       move = this.drawForcedLegal(player, this.snap.turnIndex);
       forced = true;
@@ -746,17 +854,20 @@ export class RoomCore {
     if (forced) evData['forced'] = 'illegal';
     this.emit(nowMs, 'move', evData);
 
+    // Three strikes forfeit BEFORE the terminal check runs (safety net; the
+    // submit paths already forfeit third strikes without applying a move): a
+    // striker must never be crowned by their own forced game-ending move.
+    if (forced && (this.snap.strikes[player] ?? 0) >= 3) {
+      this.forfeit(nowMs, player);
+      return;
+    }
+
     this.advanceTurn(nowMs, turn);
     if (this.snap.status !== 'running') return;
 
     // A pending offer expires once the acceptance turn has been consumed.
     const offer = this.snap.pendingDrawOffer;
     if (offer !== null && offer.validAtTurn <= turn) this.snap.pendingDrawOffer = null;
-
-    // Three strikes forfeit even though the forced move applied.
-    if (forced && (this.snap.strikes[player] ?? 0) >= 3) {
-      this.forfeit(nowMs, player);
-    }
   }
 
   private advanceTurn(nowMs: number, justPlayedTurn: number): void {
@@ -777,10 +888,11 @@ export class RoomCore {
     this.emit(nowMs, 'strike', { turn_index: turn, player, reason, strike_count: count });
   }
 
-  private forfeit(nowMs: number, player: PlayerId): void {
+  /** 'three_strikes' = the frozen strike policy; 'time' = cumulative side clock exhausted (flag fall). */
+  private forfeit(nowMs: number, player: PlayerId, reason: 'three_strikes' | 'time' = 'three_strikes'): void {
     if (this.snap.status !== 'running') return;
-    this.appendLog(nowMs, 'forfeit', { player, reason: 'three_strikes' }, null);
-    this.emit(nowMs, 'forfeit', { player, reason: 'three_strikes' });
+    this.appendLog(nowMs, 'forfeit', { player, reason }, null);
+    this.emit(nowMs, 'forfeit', { player, reason });
     const winners = this.snap.seats.map((s) => s.player).filter((p) => p !== player);
     this.endGame(nowMs, { winners, draw: false, reason: 'forfeit' });
   }
@@ -859,6 +971,13 @@ export class RoomCore {
       let strikeReason: string | null = null;
 
       if (h.forced === 'timeout') {
+        // Third strike: the forfeit beats the forced default (spec: three
+        // strikes forfeit) — no move is drawn or applied.
+        if ((this.snap.strikes[player] ?? 0) >= 2) {
+          this.recordStrike(nowMs, player, 'timeout', turn);
+          this.forfeit(nowMs, player);
+          return;
+        }
         const legal = this.game.legalMoves(this.snap.state, player);
         if (legal.length === 0) throw new Error(`resolveSimultaneous: ${player} to move with no legal moves`);
         move = this.game.defaultMove
@@ -877,7 +996,13 @@ export class RoomCore {
       if (isRuleError(applied)) {
         if (h.forced !== null) throw new Error(`resolveSimultaneous: forced move rejected: ${applied.message}`);
         // The state shifted under a previously-legal held move: substitute a
-        // seeded random legal move and record a strike.
+        // seeded random legal move and record a strike — unless that strike
+        // is the third, in which case the forfeit beats the substitution.
+        if ((this.snap.strikes[player] ?? 0) >= 2) {
+          this.recordStrike(nowMs, player, 'illegal_move', turn);
+          this.forfeit(nowMs, player);
+          return;
+        }
         move = this.drawForcedLegal(player, turn);
         strikeReason = 'illegal_move';
         applied = this.game.apply(this.snap.state, player, move, this.seed);
@@ -976,6 +1101,19 @@ export class RoomCore {
         };
         this.snap.clocks.cumulativeMs[p] = (this.snap.clocks.cumulativeMs[p] ?? 0) + this.budgetMs();
       }
+      // A fallen flag (cumulative side clock exhausted) beats resolution: the
+      // first absentee in seat order past their budget loses on time.
+      for (const s of this.snap.seats) {
+        if (this.snap.pendingSimultaneous[s.player]?.forced === 'timeout' && this.flagFallen(s.player)) {
+          this.forfeit(nowMs, s.player, 'time');
+          return {
+            fired: true,
+            ended: this.isEnded(),
+            deadline_at_ms: this.snap.deadlineAtMs,
+            events: this.snap.events.slice(evStart),
+          };
+        }
+      }
       this.resolveSimultaneous(nowMs);
       return {
         fired: true,
@@ -992,6 +1130,36 @@ export class RoomCore {
     }
     const seat = this.seatByPlayer(player)!;
     const turn = this.snap.turnIndex;
+
+    // A timeout charges the full per-move budget, never the alarm latency.
+    this.snap.clocks.cumulativeMs[player] = (this.snap.clocks.cumulativeMs[player] ?? 0) + this.budgetMs();
+
+    // Third strike: the forfeit beats the forced default move (spec: "Three
+    // strikes in a game forfeit it") — nothing is applied, so the striker can
+    // never win by their own forced game-ending move.
+    if ((this.snap.strikes[player] ?? 0) >= 2) {
+      this.recordStrike(nowMs, player, 'timeout', turn);
+      this.forfeit(nowMs, player);
+      return {
+        fired: true,
+        ended: this.isEnded(),
+        deadline_at_ms: this.snap.deadlineAtMs,
+        events: this.snap.events.slice(evStart),
+      };
+    }
+
+    // Cumulative side clock exhausted (spec games.chess.clock): flag fall —
+    // the stalling player loses on time.
+    if (this.flagFallen(player)) {
+      this.forfeit(nowMs, player, 'time');
+      return {
+        fired: true,
+        ended: this.isEnded(),
+        deadline_at_ms: this.snap.deadlineAtMs,
+        events: this.snap.events.slice(evStart),
+      };
+    }
+
     const legal = this.game.legalMoves(this.snap.state, player);
     if (legal.length === 0) throw new Error(`timeout: ${player} to move with no legal moves`);
 
@@ -1006,7 +1174,6 @@ export class RoomCore {
     const notation = this.game.moveToNotation(move, this.snap.state);
     this.snap.state = applied.state;
     const stateHash = hashState(this.snap.state);
-    this.snap.clocks.cumulativeMs[player] = (this.snap.clocks.cumulativeMs[player] ?? 0) + this.budgetMs();
 
     const count = (this.snap.strikes[player] ?? 0) + 1;
     this.appendLog(nowMs, 'timeout', {
@@ -1037,7 +1204,6 @@ export class RoomCore {
     if (this.snap.status === 'running') {
       const offer = this.snap.pendingDrawOffer;
       if (offer !== null && offer.validAtTurn <= turn) this.snap.pendingDrawOffer = null;
-      if ((this.snap.strikes[player] ?? 0) >= 3) this.forfeit(nowMs, player);
     }
 
     return {

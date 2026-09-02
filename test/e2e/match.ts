@@ -64,7 +64,12 @@ function findIdx(view: ViewObject, pred: (notation: string) => boolean): number 
 export const landlordStrategy: Strategy = (view, ctx) => {
   const accept = findIdx(view, (n) => n.startsWith('accept('));
   if (accept !== null) return accept;
-  if (!ctx.flags.auction && view.phase === 'buy_or_auction') {
+  if (view.phase === 'buy_or_auction') {
+    // First unowned-property decision: decline, to force an auction. After
+    // that: buy, so rents (and eventually bankruptcies) actually happen.
+    const target = ctx.flags.auction ? 'buy' : 'decline';
+    const found = findIdx(view, (n) => n === target);
+    if (found !== null) return found;
     const decline = findIdx(view, (n) => n === 'decline');
     if (decline !== null) return decline;
   }
@@ -77,12 +82,17 @@ export const landlordStrategy: Strategy = (view, ctx) => {
     const decline = findIdx(view, (n) => n === 'decline');
     if (decline !== null) return decline;
   }
+  if (view.phase === 'roll') {
+    const roll = findIdx(view, (n) => n === 'roll');
+    if (roll !== null && ctx.seed.int(`rollcoin:${ctx.decision}`, 10) < 8) return roll;
+  }
   if (view.phase === 'manage' && ctx.seed.int(`offercoin:${ctx.decision}`, 10) < 3) {
     const offers = view.legal_moves.filter((m) => m.notation.startsWith('offer('));
     if (offers.length > 0) return offers[ctx.seed.int(`offerpick:${ctx.decision}`, offers.length)]!.index;
   }
-  // Bias slightly toward ending turns so 3-player games do not sprawl.
-  if (view.phase === 'manage' && ctx.seed.int(`endcoin:${ctx.decision}`, 10) < 6) {
+  // Strong end_turn bias: keeps rounds short so the game fits the room's
+  // single-blob snapshot limit (see notes/e2e-driver.md on SQLITE_TOOBIG).
+  if (view.phase === 'manage' && ctx.seed.int(`endcoin:${ctx.decision}`, 10) < 8) {
     const end = findIdx(view, (n) => n === 'end_turn');
     if (end !== null) return end;
   }
@@ -99,12 +109,20 @@ export const islandersStrategy: Strategy = (view, ctx) => {
   if (accept !== null) return accept;
   const robs = view.legal_moves.filter((m) => /^move_bandit\([^,]+,(?!-\))[^)]+\)$/.test(m.notation));
   if (robs.length > 0) return robs[ctx.seed.int(`rob:${ctx.decision}`, robs.length)]!.index;
+  // Build priority: race to 10 VP so the game ends by points well before the
+  // 100-round limit (which would overflow the room's single-blob snapshot).
+  for (const prefix of ['build_city(', 'build_village(', 'build_road('] as const) {
+    const builds = view.legal_moves.filter((m) => m.notation.startsWith(prefix));
+    if (builds.length > 0 && ctx.seed.int(`build:${prefix}:${ctx.decision}`, 10) < 9) {
+      return builds[ctx.seed.int(`buildpick:${ctx.decision}`, builds.length)]!.index;
+    }
+  }
   if (ctx.seed.int(`offercoin:${ctx.decision}`, 20) < 3) {
     const offers = view.legal_moves.filter((m) => m.notation.startsWith('offer('));
     if (offers.length > 0) return offers[ctx.seed.int(`offerpick:${ctx.decision}`, offers.length)]!.index;
   }
-  // Bias toward end_turn a bit so 100-round games do not sprawl.
-  if (ctx.seed.int(`endcoin:${ctx.decision}`, 10) < 5) {
+  // Otherwise end the turn briskly (production still happens every roll).
+  if (ctx.seed.int(`endcoin:${ctx.decision}`, 10) < 8) {
     const end = findIdx(view, (n) => n === 'end_turn');
     if (end !== null) return end;
   }
@@ -138,26 +156,55 @@ export function normalizeEvents(raw: unknown): NormalizedEvent[] {
   return out;
 }
 
-/** Fetch + normalize spectator events regardless of live/D1 serving shape. */
+/**
+ * Fetch + normalize spectator events regardless of live/D1 serving shape,
+ * paginating past the endpoint's 500-row page until the stream is drained.
+ */
 export async function fetchEvents(base: string, gameId: string, since = 0): Promise<NormalizedEvent[]> {
-  const res = await fetch(`${base}/api/games/${gameId}/events?since=${since}`);
-  if (res.status === 429) {
-    await res.body?.cancel();
-    await fetch(`${base}/e2e/unlimit`, { method: 'POST' }).catch(() => undefined);
-    await sleep(200);
-    return fetchEvents(base, gameId, since);
+  const all: NormalizedEvent[] = [];
+  let cursor = since;
+  for (let page = 0; page < 40; page++) {
+    const res = await fetch(`${base}/api/games/${gameId}/events?since=${cursor}`);
+    if (res.status === 429) {
+      await res.body?.cancel();
+      await fetch(`${base}/e2e/unlimit`, { method: 'POST' }).catch(() => undefined);
+      await sleep(200);
+      page--;
+      continue;
+    }
+    const batch = normalizeEvents((await res.json()) as unknown);
+    const fresh = batch.filter((e) => e.seq > cursor);
+    if (fresh.length === 0) break;
+    for (const e of fresh) cursor = Math.max(cursor, e.seq);
+    all.push(...fresh);
   }
-  const body = (await res.json()) as unknown;
-  return normalizeEvents(body);
+  return all;
 }
 
-function updateFlags(flags: MatchFlags, events: readonly NormalizedEvent[]): void {
+/**
+ * Target-event detection. The room's spectator stream carries only room-level
+ * 'move' events (the game modules' own GameEvents — auction_start, trade,
+ * stolen, bankruptcy — are dropped by the room; see notes/e2e-driver.md), so
+ * the flags are derived from the PUBLIC move notations and the public phase:
+ *   - auction:    an auction_bid(...) notation, or the public phase 'auction'
+ *   - trade:      an applied accept(id) notation (landlord and islanders)
+ *   - steal:      move_bandit(hex,victim)/warrior with a real victim (not '-')
+ *   - bankruptcy: an applied declare_bankruptcy notation
+ */
+export function updateFlags(flags: MatchFlags, events: readonly NormalizedEvent[]): void {
   for (const e of events) {
-    if (e.type === 'auction_start') flags.auction = true;
-    if (e.type === 'auction_won') flags.auctionWon = true;
-    if (e.type === 'trade' || e.type === 'accept') flags.trade = true;
-    if (e.type === 'stolen') flags.steal = true;
-    if (e.type === 'bankruptcy') flags.bankruptcy = true;
+    if (e.type !== 'move' || !e.data || typeof e.data !== 'object' || Array.isArray(e.data)) continue;
+    const data = e.data as { notation?: string; public?: { phase?: string } };
+    const n = data.notation ?? '';
+    if (n.startsWith('auction_bid(')) flags.auction = true;
+    if (data.public && typeof data.public === 'object' && (data.public as { phase?: string }).phase === 'auction') {
+      flags.auction = true;
+    }
+    if (n.startsWith('accept(')) flags.trade = true;
+    if ((n.startsWith('move_bandit(') || n.startsWith('play_progress(warrior')) && !n.endsWith(',-)')) {
+      flags.steal = true;
+    }
+    if (n === 'declare_bankruptcy') flags.bankruptcy = true;
   }
 }
 
@@ -177,6 +224,14 @@ export interface MatchOptions {
   perMoveMs?: number;
   /** Safety cap on total applied decisions before the driver gives up. */
   maxDecisions?: number;
+  /**
+   * Legitimate early end: once this many decisions have been applied, the
+   * next player to move RESIGNS (a signed move; the room ends the game with a
+   * real 'resignation' result). Needed for the trading games, whose natural
+   * turn-limit length overflows the room's single-blob DO snapshot (product
+   * bug, see notes/e2e-driver.md).
+   */
+  resignAfterDecisions?: number;
   /** Distinguishes retries; feeds handles + strategy seeds. */
   label: string;
   commentaryEvery?: number;
@@ -311,6 +366,15 @@ export async function runMatch(h: Harness, opts: MatchOptions): Promise<MatchRep
         throw e;
       }
       if (view.legal_moves.length === 0) continue;
+      if (opts.resignAfterDecisions !== undefined && decisions >= opts.resignAfterDecisions) {
+        const out = await c.resign(gameId, view.turn_index, transports[ix]);
+        decisions++;
+        if (out.verdict.ended === true) {
+          ended = true;
+          break;
+        }
+        continue;
+      }
       const ctx: StrategyCtx = { flags, seed: seeds[ix]!, decision: decisions };
       const pick = strategies[ix]!(view, ctx);
       const commentary =
@@ -330,6 +394,10 @@ export async function runMatch(h: Harness, opts: MatchOptions): Promise<MatchRep
             waiting = []; // stale view; re-probe everyone
             continue;
           }
+          throw new Error(
+            `move rejected for ${c.handle} at turn ${view.turn_index} (picked index ${pick} of ` +
+              `${view.legal_moves.length}, phase ${view.phase}): [${e.code}] ${e.message} — room verdict: ${JSON.stringify(e.data)}`,
+          );
         }
         throw e;
       }

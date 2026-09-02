@@ -38,13 +38,20 @@
  *       'ludus.move.v1:' + game_id + ':' + payload.turn_index + ':'
  *         + sha256Hex(canonicalJson(body)).
  *   - Moves are re-resolved from submission.move (notation via parseMove,
- *     { index } into legalMoves' canonical order). If the room also logged the
- *     resolved move as payload.move it must equal the re-resolved move.
- *   - 'timeout' entries cover both penalty paths of the frozen strike policy.
- *     payload.purpose selects the seed purpose (default `timeout:turn:N`;
- *     `illegal:turn:N` for a third illegal move). game.defaultMove is used for
- *     plain timeouts when the game defines it; otherwise (and always for
- *     'illegal:*') the move is legal[seed.int(purpose, legal.length)].
+ *     the kernel '#N' index-string fallback into legalMoves' canonical order,
+ *     or { index } into the same order). If the room also logged the resolved
+ *     move as payload.move it must equal the re-resolved move.
+ *   - A 'move' entry may carry payload.forced === 'illegal' (frozen policy,
+ *     rooms/core.ts): the third illegal attempt of a turn forced a seeded
+ *     random legal move. payload.submission is then the REJECTED (but signed)
+ *     third submission — its signature is still checked — and the applied
+ *     move is recomputed as legal[seed.int('illegal:turn:N', legal.length)],
+ *     never from the submission. notation/state_hash/draws cover the applied
+ *     move.
+ *   - 'timeout' entries cover the timeout penalty path only (frozen purpose
+ *     `timeout:turn:N`; a logged payload.purpose must equal it).
+ *     game.defaultMove is used when the game defines it; otherwise the move
+ *     is legal[seed.int('timeout:turn:N', legal.length)].
  *   - entry.created_at is not verifiable offline and is ignored.
  */
 
@@ -95,11 +102,24 @@ function resolveMove(
   const raw = sub.move;
   let move: Json;
   if (typeof raw === 'string') {
-    const parsed = game.parseMove(raw, state, player);
-    if (isParseError(parsed)) {
-      return { ok: false, detail: `submission notation '${raw}' did not parse: ${parsed.message}` };
+    // Kernel-level index fallback (same frozen rule as rooms/core.ts):
+    // '#7' means legal_moves[7] in the game's canonical legalMoves order.
+    const hashIdx = /^#(\d+)$/.exec(raw.trim());
+    if (hashIdx) {
+      const idx = Number(hashIdx[1]);
+      const legal = game.legalMoves(state, player);
+      const picked = legal[idx];
+      if (picked === undefined) {
+        return { ok: false, detail: `submission index #${idx} out of range (${legal.length} legal moves)` };
+      }
+      move = picked;
+    } else {
+      const parsed = game.parseMove(raw, state, player);
+      if (isParseError(parsed)) {
+        return { ok: false, detail: `submission notation '${raw}' did not parse: ${parsed.message}` };
+      }
+      move = parsed;
     }
-    move = parsed;
   } else {
     const idxObj = asObj(raw);
     if (!idxObj || typeof idxObj.index !== 'number') {
@@ -268,14 +288,30 @@ export function verifyReplay(replay: ReplayFile, games: Record<string, AnyGame>)
         if (!sub) return `entry ${e.seq}: payload.submission missing`;
         if (sub.game_id !== replay.game_id) return `entry ${e.seq}: submission.game_id != replay.game_id`;
         if (sub.turn_index !== turn) return `entry ${e.seq}: submission.turn_index != payload.turn_index`;
-        const r = resolveMove(game, state, player, p, sub);
-        if (!r.ok) return `entry ${e.seq}: ${r.detail}`;
-        move = r.move;
+        if (p.forced !== undefined && p.forced !== 'illegal') {
+          return `entry ${e.seq}: unknown forced marker ${JSON.stringify(p.forced)}`;
+        }
+        if (p.forced === 'illegal') {
+          // Frozen policy (rooms/core.ts): third illegal attempt of the turn.
+          // The submission is the rejected-but-signed third attempt; the
+          // applied move is the seeded random legal move, purpose
+          // 'illegal:turn:N', drawn from the same stream position.
+          const legal = game.legalMoves(state, player);
+          if (legal.length === 0) return `entry ${e.seq}: forced move for ${player} but no legal moves exist`;
+          move = legal[seed.int(`illegal:turn:${turn}`, legal.length)]!;
+        } else {
+          const r = resolveMove(game, state, player, p, sub);
+          if (!r.ok) return `entry ${e.seq}: ${r.detail}`;
+          move = r.move;
+        }
       } else {
-        const purpose = typeof p.purpose === 'string' ? p.purpose : `timeout:turn:${turn}`;
+        const purpose = `timeout:turn:${turn}`;
+        if (p.purpose !== undefined && p.purpose !== purpose) {
+          return `entry ${e.seq}: timeout purpose ${JSON.stringify(p.purpose)} != frozen '${purpose}'`;
+        }
         const legal = game.legalMoves(state, player);
         if (legal.length === 0) return `entry ${e.seq}: timeout for ${player} but no legal moves exist`;
-        if (game.defaultMove && !purpose.startsWith('illegal:')) {
+        if (game.defaultMove) {
           move = game.defaultMove(state, player, legal);
         } else {
           move = legal[seed.int(purpose, legal.length)]!;

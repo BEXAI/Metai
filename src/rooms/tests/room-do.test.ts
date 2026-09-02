@@ -8,6 +8,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { verifyChain } from '../../crypto/chain.ts';
+import { roundAt } from '../../crypto/drand.ts';
 import { generateKeypair, signEd25519 } from '../../crypto/ed25519.ts';
 import type { ReplayFile } from '../../kernel/replay.ts';
 import type { Json, MoveSubmission, PlayerId } from '../../kernel/types.ts';
@@ -83,7 +84,9 @@ const createBody = {
   division: 'open' as const,
   ruleset_version: '1.0.0',
   secret_hex: '22'.repeat(32),
-  drand_round: 777,
+  // The DO creates at Date.now(); the round must be at or after that moment
+  // (spec randomness[1], enforced by RoomCore.create).
+  drand_round: roundAt(Date.now()) + 1_000,
   drand_randomness: 'cd'.repeat(32),
   per_move_ms: 60_000,
   clock_scale: 1,

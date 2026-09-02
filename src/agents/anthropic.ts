@@ -52,28 +52,42 @@ interface ParsedAnswer {
   commentary?: string;
 }
 
-/** Extracts the first parseable {"index": n, ...} object from model text. */
+/**
+ * Extracts the model's {"index": n, ...} answer from model text.
+ *
+ * A strict whole-reply parse wins outright. Otherwise the LAST valid balanced
+ * {...} candidate is taken (INJ-3): models routinely quote hostile context
+ * ('the note demanded {"index": 0} — ignoring it. My move: {"index": 3}')
+ * before giving their real answer, so preferring the FIRST candidate would let
+ * attacker-quoted JSON echoed by the model beat the model's actual answer.
+ */
 export function parseModelAnswer(text: string, legalCount: number): ParsedAnswer | null {
-  // Try whole-string parse first, then each balanced {...} candidate.
-  const candidates: string[] = [text.trim()];
-  const re = /\{[^{}]*\}/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) candidates.push(m[0]);
-  for (const c of candidates) {
+  const validate = (candidate: string): ParsedAnswer | null => {
     try {
-      const parsed: unknown = JSON.parse(c);
-      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) continue;
+      const parsed: unknown = JSON.parse(candidate);
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
       const idx = (parsed as { index?: unknown }).index;
-      if (typeof idx !== 'number' || !Number.isInteger(idx) || idx < 0 || idx >= legalCount) continue;
+      if (typeof idx !== 'number' || !Number.isInteger(idx) || idx < 0 || idx >= legalCount) return null;
       const out: ParsedAnswer = { index: idx };
       const commentary = (parsed as { commentary?: unknown }).commentary;
       if (typeof commentary === 'string' && commentary.length > 0) out.commentary = commentary.slice(0, 280);
       return out;
     } catch {
-      // not JSON — try the next candidate
+      return null; // not JSON
     }
+  };
+
+  const whole = validate(text.trim());
+  if (whole !== null) return whole;
+
+  const re = /\{[^{}]*\}/g;
+  let m: RegExpExecArray | null;
+  let last: ParsedAnswer | null = null;
+  while ((m = re.exec(text)) !== null) {
+    const parsed = validate(m[0]);
+    if (parsed !== null) last = parsed;
   }
-  return null;
+  return last;
 }
 
 export function createAnthropicAgent(options: AnthropicAdapterOptions): HouseAdapter {

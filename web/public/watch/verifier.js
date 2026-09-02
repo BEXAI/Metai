@@ -2355,11 +2355,22 @@ function resolveMove(game, state, player, payload, sub) {
   const raw = sub.move;
   let move;
   if (typeof raw === "string") {
-    const parsed = game.parseMove(raw, state, player);
-    if (isParseError(parsed)) {
-      return { ok: false, detail: `submission notation '${raw}' did not parse: ${parsed.message}` };
+    const hashIdx = /^#(\d+)$/.exec(raw.trim());
+    if (hashIdx) {
+      const idx = Number(hashIdx[1]);
+      const legal = game.legalMoves(state, player);
+      const picked = legal[idx];
+      if (picked === void 0) {
+        return { ok: false, detail: `submission index #${idx} out of range (${legal.length} legal moves)` };
+      }
+      move = picked;
+    } else {
+      const parsed = game.parseMove(raw, state, player);
+      if (isParseError(parsed)) {
+        return { ok: false, detail: `submission notation '${raw}' did not parse: ${parsed.message}` };
+      }
+      move = parsed;
     }
-    move = parsed;
   } else {
     const idxObj = asObj(raw);
     if (!idxObj || typeof idxObj.index !== "number") {
@@ -2517,14 +2528,26 @@ function verifyReplay(replay, games) {
         if (!sub) return `entry ${e.seq}: payload.submission missing`;
         if (sub.game_id !== replay.game_id) return `entry ${e.seq}: submission.game_id != replay.game_id`;
         if (sub.turn_index !== turn) return `entry ${e.seq}: submission.turn_index != payload.turn_index`;
-        const r = resolveMove(game, state, player, p, sub);
-        if (!r.ok) return `entry ${e.seq}: ${r.detail}`;
-        move = r.move;
+        if (p.forced !== void 0 && p.forced !== "illegal") {
+          return `entry ${e.seq}: unknown forced marker ${JSON.stringify(p.forced)}`;
+        }
+        if (p.forced === "illegal") {
+          const legal = game.legalMoves(state, player);
+          if (legal.length === 0) return `entry ${e.seq}: forced move for ${player} but no legal moves exist`;
+          move = legal[seed.int(`illegal:turn:${turn}`, legal.length)];
+        } else {
+          const r = resolveMove(game, state, player, p, sub);
+          if (!r.ok) return `entry ${e.seq}: ${r.detail}`;
+          move = r.move;
+        }
       } else {
-        const purpose = typeof p.purpose === "string" ? p.purpose : `timeout:turn:${turn}`;
+        const purpose = `timeout:turn:${turn}`;
+        if (p.purpose !== void 0 && p.purpose !== purpose) {
+          return `entry ${e.seq}: timeout purpose ${JSON.stringify(p.purpose)} != frozen '${purpose}'`;
+        }
         const legal = game.legalMoves(state, player);
         if (legal.length === 0) return `entry ${e.seq}: timeout for ${player} but no legal moves exist`;
-        if (game.defaultMove && !purpose.startsWith("illegal:")) {
+        if (game.defaultMove) {
           move = game.defaultMove(state, player, legal);
         } else {
           move = legal[seed.int(purpose, legal.length)];

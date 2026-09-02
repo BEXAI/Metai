@@ -60,13 +60,16 @@ describe('phantom-rook castling via decodeState (castling rights inconsistent wi
 
   it('castling with a phantom rook must never mint material out of thin air', () => {
     // Even if a fix chooses to reject at decode time, this guards the invariant:
-    // applying every legal move from the crafted state keeps the piece count.
+    // no legal move from the crafted state may INCREASE the piece count.
+    // (Strict equality would contradict the spec's FIDE laws: Ra1xa8 is a
+    // legal capture from this position and removes a piece — see
+    // notes/redteam-fixes-red-team-rules.md.)
     const st = decode('r3k3/8/8/8/8/8/8/R3K3 w K - 0 1');
     const count = (b: string): number => [...b].filter((c) => c !== '.').length;
     for (const m of legal(st, 'p0')) {
       const r = apply(st, 'p0', m);
       if (isRuleError(r)) continue;
-      expect(count((r.state as ChessState).board)).toBe(count(st.board));
+      expect(count((r.state as ChessState).board)).toBeLessThanOrEqual(count(st.board));
     }
   });
 });
