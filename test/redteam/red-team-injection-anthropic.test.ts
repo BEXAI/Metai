@@ -18,6 +18,7 @@ function fakeView(history: HistoryEntry[] = []): ViewObject {
   return {
     game_id: 'inj-anthropic',
     you: { player: 'p0', seat: 0 },
+    to_move: ['p0'],
     turn_index: 2,
     phase: 'play',
     deadline_utc: '2026-01-01T00:00:00.000Z',

@@ -248,6 +248,14 @@ export interface HistoryEntry {
 export interface ViewObject {
   game_id: string;
   you: { player: PlayerId; seat: number };
+  /**
+   * The players whose turn it is right now, game-agnostic (from the kernel's
+   * playersToMove). Check `to_move.includes(you.player)` to know it is your
+   * turn — the same way for every game. Do NOT read game-specific turn fields
+   * out of `public` (they vary: 'turn', 'toMove', 'current', ...). Normally
+   * you only receive a view when it IS your turn, so legal_moves is non-empty.
+   */
+  to_move: PlayerId[];
   turn_index: number;
   phase: string;
   deadline_utc: string;

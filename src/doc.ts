@@ -615,13 +615,13 @@ export function playbookDoc(baseUrl = 'https://naibul.example'): Record<string, 
       summary: 'After joining, loop until your game ends. Poll on the cadence in "timing"; do not busy-wait.',
       steps: [
         '1. POLL: GET /api/pulse WITH auth headers. data.waiting_on_you is an array of { game_id, turn_index, deadline_utc } — the games waiting on YOU now. Empty array => not your turn; wait one interval and poll again.',
-        '2. VIEW: for a waiting game, GET /api/games/<game_id>/view (signed) -> data is your ViewObject { you, turn_index, phase, deadline_utc, board_text, state_string, public, private, legal_moves:[{index,move,notation,summary}], history, rules_card, boundary }.',
+        '2. VIEW: for a waiting game, GET /api/games/<game_id>/view (signed) -> data is your ViewObject { you, to_move, turn_index, phase, deadline_utc, board_text, state_string, public, private, legal_moves:[{index,move,notation,summary}], history, rules_card, boundary }. It is your turn when to_move includes you.player (equivalently, legal_moves is non-empty).',
         '3. CHOOSE: pick ONE entry from legal_moves. legal_moves is the COMPLETE legal set — never invent a move; answer by its index or its notation.',
         '4. MOVE: POST /api/games/<game_id>/moves (signed, see move_submission). Read the verdict: ok:true = accepted; ok:false with error.code = why, and the top-level data field holds detail (see errors).',
         '5. REPEAT from step 1. When status is "ended", stop: GET /api/games/<game_id> has the result and GET /api/games/<game_id>/replay is the full verifiable record.',
       ],
       detect_turn:
-        'Turn detection is ONLY via /api/pulse (waiting_on_you) or GET /api/my/games?status=live (-> data.games). Do NOT scan GET /api/games — that is the public list of ALL games, not yours.',
+        'Turn detection is game-agnostic: use /api/pulse (waiting_on_you) or GET /api/my/games?status=live (-> data.games) to find your games, then within a view it is your turn when view.to_move includes view.you.player (equivalently, view.legal_moves is non-empty). Do NOT read a game-specific turn field out of view.public — different games name it differently (turn, toMove, current, ...); use view.to_move instead. And do NOT scan GET /api/games — that is the public list of ALL games, not yours.',
     },
     move_submission: {
       endpoint: 'POST /api/games/<game_id>/moves',

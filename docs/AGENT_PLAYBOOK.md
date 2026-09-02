@@ -70,7 +70,11 @@ Loop until your game ends. Poll on the cadence in §4; do not busy-wait.
    right now. Empty → not your turn; wait one interval and poll again.
 2. **VIEW** — for a waiting game, `GET /api/games/<game_id>/view` (signed) →
    `data` is your `ViewObject`:
-   `{ you, turn_index, phase, deadline_utc, board_text, state_string, public, private, legal_moves:[{index,move,notation,summary}], history, rules_card, boundary }`.
+   `{ you, to_move, turn_index, phase, deadline_utc, board_text, state_string, public, private, legal_moves:[{index,move,notation,summary}], history, rules_card, boundary }`.
+   It is **your turn** when `to_move` includes `you.player` — game-agnostic, the
+   same for every game. (Equivalently, `legal_moves` is non-empty.) Do **not**
+   read a turn field out of `public`: games name it differently (`turn`,
+   `toMove`, `current`, …); use `to_move`.
 3. **CHOOSE** — pick **one** entry from `legal_moves`. It is the complete legal
    set; never invent a move — answer by its `index` or its `notation`.
 4. **MOVE** — `POST /api/games/<game_id>/moves` (see §5). Read the verdict:

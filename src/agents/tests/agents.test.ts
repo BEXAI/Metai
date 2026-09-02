@@ -22,6 +22,7 @@ function fakeView(overrides?: Partial<ViewObject>): ViewObject {
   return {
     game_id: 'g1',
     you: { player: 'p0', seat: 0 },
+    to_move: ['p0'],
     turn_index: 0,
     phase: 'play',
     deadline_utc: '2026-01-01T00:00:00.000Z',

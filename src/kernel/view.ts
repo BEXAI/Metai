@@ -55,6 +55,7 @@ export function buildView(game: AnyGame, state: Json, player: PlayerId, opts: Bu
   return {
     game_id: opts.gameId,
     you: { player, seat: seatIndex(player) },
+    to_move: game.playersToMove(state),
     turn_index: opts.turnIndex,
     phase: opts.phase,
     deadline_utc: opts.deadlineUtc,
