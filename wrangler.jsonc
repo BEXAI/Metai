@@ -3,6 +3,7 @@
   // R2 replay blobs; KV caches; 5-minute cron for checkpoints/clocks/queues.
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "ludus",
+  "account_id": "e6253033b602dbb1445f44393ea7da2b",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-01",
   "compatibility_flags": ["nodejs_compat"],
@@ -26,14 +27,21 @@
   "triggers": { "crons": ["*/5 * * * *"] },
   "env": {
     "staging": {
+      "assets": {
+        "directory": "web/public",
+        "binding": "ASSETS"
+      },
       "d1_databases": [
-        { "binding": "DB", "database_name": "ludus-staging", "database_id": "00000000-0000-0000-0000-000000000000" }
+        { "binding": "DB", "database_name": "ludus-staging", "database_id": "143516a3-3f02-4fa5-8384-11db907b144f" }
       ],
       "durable_objects": {
         "bindings": [{ "name": "GAME_ROOM", "class_name": "GameRoom" }]
       },
-      "r2_buckets": [{ "binding": "REPLAYS", "bucket_name": "ludus-replays-staging" }],
-      "kv_namespaces": [{ "binding": "CACHE", "id": "00000000000000000000000000000000" }],
+      // R2 not enabled on this account yet (dashboard action). Rooms and the
+      // replay endpoint both degrade to the D1 log fallback without REPLAYS;
+      // re-add { "binding": "REPLAYS", "bucket_name": "ludus-replays-staging" }
+      // after enabling R2 and creating the bucket.
+      "kv_namespaces": [{ "binding": "CACHE", "id": "ff8b8549564d45048c6186265f85785f" }],
       "triggers": { "crons": ["*/5 * * * *"] }
     }
   }

@@ -111,7 +111,9 @@ No `ANTHROPIC_API_KEY` existed in the build environment, so **house LLM matches 
 
 ## Staging deploy
 
-**Blocked on `wrangler login`** — the environment has no authenticated Cloudflare account. Everything is verified on `wrangler dev` (local D1/DO/R2/KV). Once logged in: create the staging D1/KV/R2 resources, paste their ids into `wrangler.jsonc` (`env.staging`), run `npx wrangler d1 execute DB --env staging --remote --file=schema.sql`, then `npm run deploy:staging`, and smoke-test `/`, `/api/games`, `/mcp`, `/watch/`. Estimated cost: within Cloudflare's free tier (Workers paid plan may be required for Durable Objects depending on account type).
+**LIVE: https://ludus-staging.ludus.workers.dev** (account BEXAI, version `e4086e8c`). Deployed after all gates passed: D1 `ludus-staging` (schema applied remotely, 15 tables), KV cache, `GameRoom` Durable Object (SQLite class), 26 spectator assets, 5-minute cron. Smoke-verified live: front door, `/api/games`, MCP `tools/list` (16 tools), `/watch/` with CSP, `/openapi.json` (27 paths), `/api/official`, `/api/docket` — plus a full Ed25519 challenge-auth registration round-trip (201 + correct 401 on a spoofed handle) against the deployed Worker.
+
+One gap: **R2 is not enabled on the account** (requires a Cloudflare Dashboard action, typically with a payment method on file). The Worker degrades gracefully — rooms skip the blob upload and replays serve from the D1 log fallback. To restore full replay blobs: enable R2 in the dashboard, `npx wrangler r2 bucket create ludus-replays-staging`, and re-add the `REPLAYS` binding in `wrangler.jsonc` `env.staging` (comment marks the spot), then redeploy. House LLM agents additionally need `npx wrangler secret put ANTHROPIC_API_KEY --env staging`.
 
 ## Top five risks going into M4
 
