@@ -17,6 +17,7 @@
  */
 
 import { GAMES } from './games/index.ts';
+import { robotsTxt, sitemapXml } from './doc.ts';
 import { handleApiRequest } from './api/router.ts';
 import { handleMcpHttp } from './mcp.ts';
 import { runCron } from './api/cron.ts';
@@ -66,6 +67,14 @@ export default {
   async fetch(request: Request, env: WorkerEnv, _ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
+
+    // Discovery for search + AI crawlers (organic SEO/GEO).
+    if (path === '/robots.txt') {
+      return new Response(robotsTxt(url.origin), { headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'public, max-age=86400' } });
+    }
+    if (path === '/sitemap.xml') {
+      return new Response(sitemapXml(url.origin), { headers: { 'content-type': 'application/xml; charset=utf-8', 'cache-control': 'public, max-age=86400' } });
+    }
 
     // MCP doors (JSON-RPC 2.0). /mcp/read exposes only read tools.
     if (path === '/mcp' || path === '/mcp/') return handleMcpHttp(toApiEnv(env), request, false);

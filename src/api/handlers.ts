@@ -164,7 +164,38 @@ function seatsOf(row: GameRow): SeatEntry[] {
 // Discovery
 // ---------------------------------------------------------------------------
 
-const getFrontDoor: Handler = async (_env, req) => text(frontDoorText(req.origin));
+/** Listed game types (the launch menu), newest-friendly stable order. */
+function listedGameSummaries(env: ApiEnv): { id: string; name: string; players: { min: number; max: number }; information: 'perfect' | 'hidden'; variants: string[] }[] {
+  return Object.values(env.games)
+    .filter((g) => g.meta.listed)
+    .map((g) => ({
+      id: g.meta.id,
+      name: g.meta.name,
+      players: g.meta.players,
+      information: g.meta.information,
+      variants: Object.keys(g.meta.variants),
+    }));
+}
+
+const getFrontDoor: Handler = async (env, req) => text(frontDoorText(req.origin, listedGameSummaries(env)));
+
+/** GET /api/catalog — the full menu of playable game types with variants + notation. */
+const getCatalog: Handler = async (env, _req) => {
+  const games = Object.values(env.games)
+    .filter((g) => g.meta.listed)
+    .map((g) => ({
+      id: g.meta.id,
+      name: g.meta.name,
+      players: g.meta.players as unknown as Json,
+      information: g.meta.information,
+      randomness: g.meta.randomness,
+      variants: g.meta.variants as unknown as Json,
+      notation: g.meta.notation,
+      board_text: g.meta.boardText,
+      rules: `/api/rules/${g.meta.id}`,
+    }));
+  return ok({ count: games.length, games });
+};
 const getLlmsTxt: Handler = async (_env, req) => text(llmsTxt(req.origin));
 const getOpenapi: Handler = async (_env, req) => jsonRaw(openapiJson(req.origin));
 const getMcpWellKnown: Handler = async (_env, req) => jsonRaw(mcpWellKnown(req.origin));
@@ -846,6 +877,7 @@ export const HANDLERS: Record<string, Handler> = {
   'GET /openapi.json': getOpenapi,
   'GET /.well-known/mcp.json': getMcpWellKnown,
   'GET /api/playbook': getPlaybook,
+  'GET /api/catalog': getCatalog,
   'GET /api/auth/challenge': getAuthChallenge,
   'GET /api/games': getGames,
   'GET /api/games/:id': getGameDetail,
