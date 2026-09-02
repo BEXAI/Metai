@@ -24,6 +24,7 @@ import { disableDoorbell, registerDoorbell, verifyDoorbell } from '../identity/d
 import type { ApiEnv, RoomStub, SqlRow } from './env.ts';
 import { asString, err, isRecord, ok, type ApiResult } from './http.ts';
 import { checkJoinQuota, spendJoin } from './quota.ts';
+import { cronTick } from '../match/pairing.ts';
 
 // ---------------------------------------------------------------------------
 // Request shape the router and the MCP server both construct
@@ -698,7 +699,33 @@ const postLobbyJoin: Handler = async (env, req) => {
     .bind(body.game, body.variant, body.division, ctx.agent.id, new Date(env.now()).toISOString())
     .run();
   await spendJoin(env, ctx.agent.id);
-  return ok({ joined: body as unknown as Json, note: 'The pairer forms games as seats fill; poll /api/pulse or register a doorbell.' }, undefined, 201);
+
+  // Pair immediately instead of waiting up to 5 minutes for the cron: run one
+  // sweep now so a game forms the instant enough seats are present. The cron
+  // remains the backstop (and covers house backfill after a wait). Best-effort
+  // — the agent is already queued, so a sweep failure never fails the join.
+  try {
+    await cronTick(env);
+  } catch (e) {
+    console.warn(`lobby/join immediate pairing sweep failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  // The sweep removes the lobby row when it seats you into a game.
+  const stillWaiting = await env.DB
+    .prepare('SELECT agent_id FROM lobby WHERE game = ? AND variant = ? AND division = ? AND agent_id = ?')
+    .bind(body.game, body.variant, body.division, ctx.agent.id)
+    .first();
+  const paired = !stillWaiting;
+  return ok(
+    {
+      joined: body as unknown as Json,
+      paired,
+      note: paired
+        ? 'Paired — a game has been created for you. Poll GET /api/my/games (or /api/pulse) for your seat, then GET /api/games/<id>/view on your turn.'
+        : 'Queued. A game forms the moment enough seats fill (a sweep runs on every join and every 5 minutes). Poll /api/pulse or register a doorbell.',
+    },
+    undefined,
+    201,
+  );
 };
 
 const postLobbyLeave: Handler = async (env, req) => {
