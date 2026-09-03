@@ -25,6 +25,7 @@ import type { ApiEnv, RoomStub, SqlRow } from './env.ts';
 import { asString, err, isRecord, ok, type ApiResult } from './http.ts';
 import { checkJoinQuota, spendJoin } from './quota.ts';
 import { buildHowto } from '../games/howto.ts';
+import { createSeedStream } from '../kernel/seed.ts';
 import { cronTick } from '../match/pairing.ts';
 
 // ---------------------------------------------------------------------------
@@ -371,24 +372,81 @@ const getGameReplay: Handler = async (env, req) => {
   }));
   const reveal = log.find((e) => e.kind === 'reveal');
   const revealPayload = reveal && isRecord(reveal.payload) ? reveal.payload : {};
+  const finalSeed = asString(revealPayload.final_seed) ?? '';
+  const seatList = parseJsonColumn(row.seats_json) ?? [];
+  const variantCfg = parseJsonColumn(row.variant) ?? {};
+
+  /**
+   * Recompute the initial state instead of serving null.
+   *
+   * Without it a replay CANNOT be verified offline — the verifier has nothing
+   * to replay the moves against — so every replay served from this fallback
+   * failed the project's own verifier, silently breaking the hall's central
+   * promise that a stranger can recompute a finished game. Everything needed is
+   * already here and deterministic: the game module, the revealed final_seed,
+   * the seats and the variant. This is exactly the computation the verifier
+   * itself performs, which is why it can be trusted to reproduce.
+   *
+   * (The R2 blob remains the primary source and carries the recorded draws;
+   * this path exists because R2 is not enabled on the account.)
+   */
+  let initialState: Json = null;
+  let recomputed = false;
+  /**
+   * The draw log the verifier compares against: the setup draws taken while
+   * building the initial state, followed by each entry's recorded draws in seq
+   * order. Serving [] made the verifier's seed_draws check fail even when
+   * everything else verified.
+   */
+  const seedDraws: Json[] = [];
+  const gameModule = lookupGame(env, row.game);
+  if (gameModule && /^[0-9a-f]{64}$/.test(finalSeed) && Array.isArray(seatList)) {
+    try {
+      const players = seatList
+        .map((s) => (isRecord(s) && typeof s.player === 'string' ? s.player : null))
+        .filter((p): p is string => p !== null);
+      if (players.length > 0) {
+        const stream = createSeedStream(finalSeed);
+        initialState = gameModule.initialState(
+          stream,
+          players,
+          variantCfg as Record<string, string | number | boolean>,
+        );
+        // Randomness consumed by setup (shuffles, layouts, opening dice).
+        for (const d of stream.draws()) seedDraws.push(d as unknown as Json);
+        // Then every draw the rooms recorded per entry, in order.
+        for (const entry of log) {
+          const p = entry.payload;
+          if (isRecord(p) && Array.isArray(p.draws)) {
+            for (const d of p.draws) seedDraws.push(d as Json);
+          }
+        }
+        recomputed = true;
+      }
+    } catch (e) {
+      // Never fail the request over this: an unverifiable replay still beats a 500.
+      console.warn(`replay ${id}: could not recompute initial_state: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   const replay: Json = {
     version: 'ludus.replay.v1',
     game_id: id,
     game: row.game,
-    variant: parseJsonColumn(row.variant) ?? {},
+    variant: variantCfg,
     division: row.division ?? 'open',
     ruleset_version: row.ruleset_version ?? '',
-    seats: parseJsonColumn(row.seats_json) ?? [],
+    seats: seatList,
     commitment: row.commitment ?? '',
     drand_round: row.drand_round ?? 0,
     drand_randomness: asString(revealPayload.drand_randomness) ?? '',
     reveal_secret: row.reveal_secret ?? asString(revealPayload.reveal_secret) ?? '',
-    final_seed: asString(revealPayload.final_seed) ?? '',
-    initial_state: null, // recomputable: game.initialState(createSeedStream(final_seed), players, variant)
+    final_seed: finalSeed,
+    initial_state: initialState,
     log: log as unknown as Json,
     result: parseJsonColumn(row.result_json),
-    seed_draws: [],
-    reconstructed_from: 'd1',
+    seed_draws: seedDraws as unknown as Json,
+    reconstructed_from: recomputed ? 'd1+recomputed-initial-state' : 'd1',
   };
   return ok({ replay }, ['data.replay.log[].payload.submission.commentary']);
 };
