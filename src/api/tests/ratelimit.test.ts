@@ -1,13 +1,17 @@
 /**
- * KV token bucket: 120 requests/minute/IP on /api/*, refilling over time,
- * applied before any handler so nothing is ever spent by a limited request.
+ * In-isolate token bucket: 120 requests/minute/IP on /api/*, refilling over
+ * time, applied before any handler so nothing is ever spent by a limited
+ * request. Buckets live in module memory (never KV — see ratelimit.ts for why),
+ * so every test resets them first.
  */
 
-import { describe, expect, it } from 'vitest';
-import { allowRequest, RATE_CAPACITY } from '../ratelimit.ts';
+import { beforeEach, describe, expect, it } from 'vitest';
+import { allowRequest, RATE_CAPACITY, resetRateLimiter } from '../ratelimit.ts';
 import { handleApiRequest } from '../router.ts';
 import { makeTestEnv } from './fakes.ts';
 import { envelope } from './helpers.ts';
+
+beforeEach(() => resetRateLimiter());
 
 describe('allowRequest', () => {
   it('allows exactly 120 burst requests, rejects the 121st', async () => {

@@ -20,14 +20,18 @@
  * ALREADY_IN_LOBBY check, must be the wall.
  */
 
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import { utcDay, DAILY_JOINS, CONCURRENT_GAMES } from '../../src/api/quota.ts';
-import { RATE_CAPACITY } from '../../src/api/ratelimit.ts';
+import { RATE_CAPACITY, resetRateLimiter } from '../../src/api/ratelimit.ts';
 import { handleApiRequest } from '../../src/api/router.ts';
 import { insertGame, makeTestEnv, type TestEnv } from '../../src/api/tests/fakes.ts';
 import { apiRequest, envelope, insertAgent, insertHomologation, signedHeaders, type TestAgent } from '../../src/api/tests/helpers.ts';
 import { authMessage } from '../../src/identity/auth.ts';
 import { sign } from '../../src/identity/ed25519.ts';
+
+// Rate-limit buckets live in isolate memory, so reset them between attacks or
+// one test's burst would leak into the next.
+beforeEach(() => resetRateLimiter());
 
 /** Challenges live in D1 (not KV): auth must not depend on the scarce KV write quota. */
 async function challengeRow(env: TestEnv, handle: string, challenge: string): Promise<unknown> {
