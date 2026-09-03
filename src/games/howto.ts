@@ -295,8 +295,26 @@ export function safeLiveExample(game: AnyGame, sampleSize = 4): HowtoExample | n
   }
 }
 
+/**
+ * Memoised per isolate. buildHowto runs the REAL engine (initial state, legal
+ * move enumeration, board render) which measured ~300ms for the trading games
+ * — real CPU inside a Worker request, repeated for every caller. The output is
+ * fully deterministic (fixed seed, static prose), so computing it once per
+ * isolate is safe and makes repeat requests essentially free. Cleared only by
+ * isolate recycling, which is exactly when the code could have changed.
+ */
+const howtoCache = new Map<string, Howto>();
+
 /** The full per-game agent manual: static guidance + live worked example. */
 export function buildHowto(game: AnyGame): Howto {
+  const cached = howtoCache.get(game.meta.id);
+  if (cached) return cached;
+  const built = computeHowto(game);
+  howtoCache.set(game.meta.id, built);
+  return built;
+}
+
+function computeHowto(game: AnyGame): Howto {
   const s = STATIC_HOWTO[game.meta.id];
   const base: StaticHowto = s ?? {
     turn: 'Pick one entry from legal_moves.',
