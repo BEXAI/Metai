@@ -16,7 +16,7 @@
  */
 
 import { frontDoorText, llmsTxt, mcpWellKnown, officialDoc, openapiJson, playbookDoc } from '../doc.ts';
-import type { Json } from '../kernel/types.ts';
+import type { AnyGame, Json } from '../kernel/types.ts';
 import { authenticate, issueChallenge, HANDLE_RE, type AuthContext, type AuthRequestInfo } from '../identity/auth.ts';
 import { registerAgent, validateRegisterBody } from '../identity/register.ts';
 import { homologate, validateHomologateBody } from '../identity/homologation.ts';
@@ -164,6 +164,16 @@ function seatsOf(row: GameRow): SeatEntry[] {
 // ---------------------------------------------------------------------------
 // Discovery
 // ---------------------------------------------------------------------------
+
+/**
+ * Look a game up by id WITHOUT inheriting Object.prototype. `env.games[id]`
+ * returned a function for ids like 'toString' or 'constructor', which then blew
+ * up on `.meta` and surfaced as a 500 on public endpoints
+ * (GET /api/rules/toString was live-reproducible). Unknown ids must 404/400.
+ */
+function lookupGame(env: ApiEnv, id: string): AnyGame | undefined {
+  return Object.prototype.hasOwnProperty.call(env.games, id) ? env.games[id] : undefined;
+}
 
 /** Listed game types (the launch menu), newest-friendly stable order. */
 function listedGameSummaries(env: ApiEnv): { id: string; name: string; players: { min: number; max: number }; information: 'perfect' | 'hidden'; variants: string[] }[] {
@@ -488,7 +498,7 @@ const getLeaderboards: Handler = async (env, req) => {
 
 const getRules: Handler = async (env, req) => {
   const id = req.params.game ?? '';
-  const game = env.games[id];
+  const game = lookupGame(env, id);
   if (!game) return err(404, 'GAME_UNKNOWN', `No game '${id}'. GET /api/games for the list.`);
   const meta = game.meta;
   const card =
@@ -636,7 +646,7 @@ const getFeedback: Handler = async (env, req) => {
 /** GET /api/howto/:game — the per-game agent operating manual. */
 const getHowto: Handler = async (env, req) => {
   const id = req.params.game ?? '';
-  const game = env.games[id];
+  const game = lookupGame(env, id);
   if (!game) return err(404, 'GAME_UNKNOWN', `No game '${id}'. GET /api/catalog for the list.`);
   return ok(buildHowto(game) as unknown as Json);
 };
@@ -857,10 +867,10 @@ interface LobbyBody {
 function validateLobbyBody(env: ApiEnv, json: Json | null): LobbyBody | ApiResult {
   if (!isRecord(json)) return err(400, 'BAD_BODY', 'Body must be a JSON object { game, variant?, division }.');
   const game = json.game;
-  if (typeof game !== 'string' || !env.games[game]) {
+  if (typeof game !== 'string' || !lookupGame(env, game)) {
     return err(400, 'GAME_UNKNOWN', `game must be one of: ${Object.keys(env.games).filter((g) => env.games[g]?.meta.listed).join(', ')}.`);
   }
-  if (!env.games[game]!.meta.listed) return err(400, 'GAME_UNLISTED', `'${game}' is not open for lobby play.`);
+  if (!lookupGame(env, game)!.meta.listed) return err(400, 'GAME_UNLISTED', `'${game}' is not open for lobby play.`);
   const division = json.division;
   if (division !== 'pure' && division !== 'open') return err(400, 'BAD_DIVISION', "division must be 'pure' or 'open'.");
   const variant = json.variant ?? 'standard';

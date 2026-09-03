@@ -19,6 +19,7 @@
 import { GAMES } from './games/index.ts';
 import { robotsTxt, sitemapXml } from './doc.ts';
 import { handleApiRequest } from './api/router.ts';
+import { allowRequest } from './api/ratelimit.ts';
 import { handleMcpHttp } from './mcp.ts';
 import { runCron } from './api/cron.ts';
 import type { ApiEnv, Db, Kv, R2Like, RoomNamespace } from './api/env.ts';
@@ -109,8 +110,20 @@ export default {
     }
 
     // MCP doors (JSON-RPC 2.0). /mcp/read exposes only read tools.
-    if (path === '/mcp' || path === '/mcp/') return handleMcpHttp(toApiEnv(env), request, false);
-    if (path === '/mcp/read' || path === '/mcp/read/') return handleMcpHttp(toApiEnv(env), request, true);
+    // Rate-limited like /api/*: these call the SAME handlers, so leaving them
+    // unthrottled left an unauthenticated door straight onto D1 that bypassed
+    // the only pre-auth ceiling in the system.
+    if (path === '/mcp' || path === '/mcp/' || path === '/mcp/read' || path === '/mcp/read/') {
+      const apiEnv = toApiEnv(env);
+      const ip = request.headers.get('cf-connecting-ip') ?? 'unknown';
+      if (!(await allowRequest(apiEnv, ip))) {
+        return new Response(
+          JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32029, message: 'Rate limit: 120 requests per minute per IP. Slow down; nothing was spent.' } }),
+          { status: 429, headers: { 'content-type': 'application/json; charset=utf-8' } },
+        );
+      }
+      return handleMcpHttp(apiEnv, request, path.startsWith('/mcp/read'));
+    }
 
     // Spectator SPA (Workers Assets serves /watch/* automatically when the
     // binding matches; this is the explicit fallback).

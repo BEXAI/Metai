@@ -14,26 +14,54 @@ import { listGames, getGameEventsSince } from '../api.js';
 import { renderBoard } from '../boards/index.js';
 import { pickGameId, pickGameType, pickSeats, pickVariant, pickDivision, displayHandle } from '../shapes.js';
 
-const POLL_MS = 5000;
-const MAX_BOARD_PREVIEWS = 16;
+/**
+ * Poll budget. This page is the single largest source of requests against the
+ * whole Worker: every tick costs 1 request for the game list plus one per
+ * board preview. At 5s x 16 previews that was up to ~294,000 requests/day from
+ * ONE open tab — past the account-wide daily request limit, and past this
+ * site's own 120 req/min/IP limiter, so the hall page 429'd itself. 30s x 4
+ * previews is ~14,400/day/tab and stays comfortably inside both.
+ */
+const POLL_MS = 30_000;
+const MAX_BOARD_PREVIEWS = 4;
+
+/**
+ * gameId -> { seq, view } so each poll asks only for events it has not seen.
+ * Previously every tick refetched the ENTIRE event log from since=0 for every
+ * previewed game, so cost grew with game length as well as with tab-time.
+ */
+const boardCursors = new Map();
+
+function absorbEvents(state, events) {
+  for (const ev of events) {
+    if (typeof ev.seq === 'number' && ev.seq > state.seq) state.seq = ev.seq;
+    if ((ev.type === 'start' || ev.type === 'move' || ev.type === 'timeout') && ev.data) {
+      if (ev.data.public !== undefined) state.pub = ev.data.public;
+      if (typeof ev.data.board_text === 'string') state.boardText = ev.data.board_text;
+    }
+  }
+  const { pub, boardText } = state;
+  if (pub && typeof pub === 'object') {
+    return boardText && pub.board_text === undefined ? { ...pub, board_text: boardText } : pub;
+  }
+  return boardText ? { board_text: boardText } : null;
+}
 
 async function fetchLatestBoard(gameId) {
+  const state = boardCursors.get(gameId) ?? { seq: 0, pub: undefined, boardText: undefined };
+  boardCursors.set(gameId, state);
   try {
-    const events = await getGameEventsSince(gameId, 0);
-    let pub;
-    let boardText;
-    for (const ev of events) {
-      if ((ev.type === 'start' || ev.type === 'move' || ev.type === 'timeout') && ev.data) {
-        if (ev.data.public !== undefined) pub = ev.data.public;
-        if (typeof ev.data.board_text === 'string') boardText = ev.data.board_text;
-      }
-    }
-    if (pub && typeof pub === 'object') return boardText && pub.board_text === undefined ? { ...pub, board_text: boardText } : pub;
-    if (boardText) return { board_text: boardText };
-    return null;
+    const events = await getGameEventsSince(gameId, state.seq);
+    return absorbEvents(state, events);
   } catch {
     return null;
   }
+}
+
+/** Drop cursors for games that are no longer live so the map cannot grow forever. */
+export function pruneBoardCursors(liveIds) {
+  const keep = new Set(liveIds);
+  for (const id of boardCursors.keys()) if (!keep.has(id)) boardCursors.delete(id);
 }
 
 function gameCard(row) {
@@ -110,6 +138,7 @@ export function mount(container) {
       const rows = await listGames({ status: 'live' });
       if (disposed || myToken !== tickToken) return;
       status.textContent = `Live games — refreshed ${new Date().toLocaleTimeString()}`;
+      pruneBoardCursors(rows.map((r) => pickGameId(r)).filter(Boolean));
       const needBoards = renderGrouped(listArea, rows, MAX_BOARD_PREVIEWS);
       for (const { id, mini, gameType } of needBoards) {
         fetchLatestBoard(id).then((view) => {

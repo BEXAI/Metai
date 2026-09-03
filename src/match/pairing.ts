@@ -515,7 +515,16 @@ export function d1GameFactory(env: ApiEnv, opts: D1FactoryOptions): GameFactory 
       // is far longer than any game (turn limits cap them at hours) and keeps
       // the namespace from growing without bound. ratings.ts already documents
       // and implements a fallback for a missing key.
-      await env.CACHE.put(`vkey:${gameId}`, cmd.variant, { expirationTtl: 30 * 24 * 60 * 60 });
+      // Guarded: this runs AFTER the room and the games row exist. An
+      // unguarded throw here (e.g. KV quota exhausted) aborted createGame with
+      // the game already created, so the pairer retried and DUPLICATED games.
+      // ratings.ts documents a fallback for a missing key, so losing it is
+      // strictly better than losing the game.
+      try {
+        await env.CACHE.put(`vkey:${gameId}`, cmd.variant, { expirationTtl: 30 * 24 * 60 * 60 });
+      } catch (e) {
+        console.warn(`pairer: could not record vkey for ${gameId}: ${e instanceof Error ? e.message : String(e)}`);
+      }
       return gameId;
     },
   };
@@ -632,7 +641,14 @@ export async function cronTick(env: ApiEnv, opts: CronTickOptions = {}): Promise
     // allows ~1,000 writes/day on the free plan.
     const stateAfter = JSON.stringify(outcome.state);
     if (stateAfter !== stateBefore) {
-      await env.CACHE.put(PAIRER_STATE_KEY, stateAfter);
+      // Guarded: the sweep has already created games and cleared lobby rows by
+      // this point, so a KV failure here must not throw away that work (or, in
+      // the cron, fail the whole 'match' step).
+      try {
+        await env.CACHE.put(PAIRER_STATE_KEY, stateAfter);
+      } catch (e) {
+        console.warn(`pairer: could not persist sweep state: ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
     return { paired: outcome.created.length };
   });

@@ -39,7 +39,17 @@ export function matchRoute(method: string, pathname: string): { route: CompiledR
       const seg = route.segments[i]!;
       const part = parts[i]!;
       if (seg.startsWith(':')) {
-        params[seg.slice(1)] = decodeURIComponent(part);
+        // decodeURIComponent throws URIError on a malformed escape (e.g. '%zz'
+        // or a lone '%'), which escaped the Worker as a raw 1101 crash with no
+        // JSON envelope. A bad path is a 404, not an exception: fall back to
+        // the raw segment so the handler can reject it normally.
+        let decoded: string;
+        try {
+          decoded = decodeURIComponent(part);
+        } catch {
+          decoded = part;
+        }
+        params[seg.slice(1)] = decoded;
       } else if (seg !== part) {
         okMatch = false;
         break;
