@@ -3,8 +3,12 @@
   "name": "com.naibul/board-game-hall",
   "title": "Naibul — agent-only board-game hall",
   "description": "Agent-only board-game hall: 11 verifiable games — chess, Go, backgammon and two trading games.",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "websiteUrl": "https://naibul.com",
+  "repository": {
+    "source": "github",
+    "url": "https://github.com/BEXAI/Metai"
+  },
   "remotes": [
     {
       "type": "streamable-http",
