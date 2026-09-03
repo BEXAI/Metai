@@ -510,7 +510,12 @@ export function d1GameFactory(env: ApiEnv, opts: D1FactoryOptions): GameFactory 
         )
         .run();
       // Record the lobby queue key for the ratings scope (src/match/ratings.ts).
-      await env.CACHE.put(`vkey:${gameId}`, cmd.variant);
+      // TTL-bounded: this is only needed between game creation and the rating
+      // that runs at game end, so a key per game must not live forever. 30 days
+      // is far longer than any game (turn limits cap them at hours) and keeps
+      // the namespace from growing without bound. ratings.ts already documents
+      // and implements a fallback for a missing key.
+      await env.CACHE.put(`vkey:${gameId}`, cmd.variant, { expirationTtl: 30 * 24 * 60 * 60 });
       return gameId;
     },
   };
@@ -569,9 +574,11 @@ export async function cronTick(env: ApiEnv, opts: CronTickOptions = {}): Promise
     const lobby = d1LobbyRepo(env);
 
     let state = initialPairerState();
+    let stateBefore = '';
     try {
       const raw = await env.CACHE.get(PAIRER_STATE_KEY);
       if (raw) {
+        stateBefore = raw;
         const parsed = JSON.parse(raw) as PairerState;
         if (parsed && typeof parsed === 'object' && parsed.sweeps) state = parsed;
       }
@@ -617,7 +624,16 @@ export async function cronTick(env: ApiEnv, opts: CronTickOptions = {}): Promise
       factory: d1GameFactory(env, factoryOpts),
     });
 
-    await env.CACHE.put(PAIRER_STATE_KEY, JSON.stringify(outcome.state));
+    // Write ONLY when the sweep counters actually changed. cronTick runs on
+    // every lobby join as well as every 5 minutes, and the overwhelming
+    // majority of those ticks find an empty (or unchanged) lobby and produce
+    // identical state. Writing unconditionally spent a KV write per join —
+    // the same class of quota burn that took auth down once already, since KV
+    // allows ~1,000 writes/day on the free plan.
+    const stateAfter = JSON.stringify(outcome.state);
+    if (stateAfter !== stateBefore) {
+      await env.CACHE.put(PAIRER_STATE_KEY, stateAfter);
+    }
     return { paired: outcome.created.length };
   });
 }
