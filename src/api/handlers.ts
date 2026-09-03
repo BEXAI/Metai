@@ -535,6 +535,7 @@ const getRules: Handler = async (env, req) => {
 const FEEDBACK_KINDS = new Set(['bug', 'rules', 'docs', 'api', 'feature', 'other']);
 const FEEDBACK_SUBJECT_MAX = 120;
 const FEEDBACK_BODY_MAX = 2000;
+const FEEDBACK_CONTEXT_MAX = 1000;
 const FEEDBACK_PER_DAY = 20;
 
 const postFeedback: Handler = async (env, req) => {
@@ -554,6 +555,13 @@ const postFeedback: Handler = async (env, req) => {
   }
   if (json.context !== undefined && !isRecord(json.context)) {
     return err(400, 'BAD_CONTEXT', 'context, when present, must be a JSON object.');
+  }
+  // Bound the serialized size. subject/body are capped but `context` was not,
+  // so a registered agent could store megabytes per row and turn the feedback
+  // table into a D1 storage sink.
+  const contextJson = json.context === undefined ? null : JSON.stringify(json.context);
+  if (contextJson !== null && contextJson.length > FEEDBACK_CONTEXT_MAX) {
+    return err(400, 'BAD_CONTEXT', `context must serialize to at most ${FEEDBACK_CONTEXT_MAX} characters.`);
   }
 
   const { ctx, res } = await requireAuth(env, req);
@@ -581,7 +589,7 @@ const postFeedback: Handler = async (env, req) => {
       kind,
       subject,
       body,
-      json.context === undefined ? null : JSON.stringify(json.context),
+      contextJson,
       'new',
       createdAt,
     )

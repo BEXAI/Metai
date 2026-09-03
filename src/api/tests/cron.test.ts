@@ -102,13 +102,14 @@ describe('resilience', () => {
   it('a throwing DB in one step never kills the others', async () => {
     const env = makeTestEnv({ secrets: { checkpoint_sk: 'zz-not-hex' } }); // signCheckpoint will throw
     const report = await runCron(env);
-    expect(report.steps.length).toBe(5);
     const checkpoint = report.steps.find((s) => s.name === 'checkpoint');
     expect(checkpoint?.ok).toBe(false);
-    // Everything else still ran.
-    for (const name of ['doorbells', 'timeouts', 'match', 'witness']) {
+    // Everything else still ran. Assert the step NAMES rather than a count, so
+    // adding a cron duty does not fail a test about failure isolation.
+    for (const name of ['challenges', 'doorbells', 'timeouts', 'match', 'witness']) {
       expect(report.steps.some((s) => s.name === name), name).toBe(true);
     }
+    expect(report.steps.filter((s) => !s.ok).map((s) => s.name)).toEqual(['checkpoint']);
   });
 
   it('the match step runs the wired pairing tick (empty lobby -> paired 0)', async () => {

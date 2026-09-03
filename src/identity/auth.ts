@@ -66,13 +66,28 @@ export async function issueChallenge(
     .prepare('INSERT OR REPLACE INTO auth_challenges (handle, challenge, expires_at_ms) VALUES (?, ?, ?)')
     .bind(handle, challenge, expMs)
     .run();
-  // Opportunistic cleanup so expired rows cannot accumulate; cheap and bounded.
-  try {
-    await env.DB.prepare('DELETE FROM auth_challenges WHERE expires_at_ms < ?').bind(nowMs - 60_000).run();
-  } catch {
-    /* best effort */
-  }
+  // NOTE: expired rows are swept by the 5-minute cron (sweepExpiredChallenges),
+  // NOT here. Sweeping on every issue added a THIRD D1 write to the hottest
+  // authenticated path; D1 allows ~100k writes/day, and an agent polling on the
+  // cadence the playbook recommends issues ~5,760 challenges/day, so the extra
+  // write meaningfully lowered how many agents the hall can carry before the
+  // write quota — and therefore authentication — falls over.
   return { challenge, expires: new Date(expMs).toISOString() };
+}
+
+/**
+ * Delete challenges that expired more than a minute ago. Called from the
+ * 5-minute cron so the cost is O(1) per period instead of O(1) per request.
+ * The bound is deliberately in the past so a live challenge (issued with
+ * now + 5 minutes) can never be swept out from under its owner.
+ */
+export async function sweepExpiredChallenges(env: ApiEnv): Promise<number> {
+  const res = await env.DB
+    .prepare('DELETE FROM auth_challenges WHERE expires_at_ms < ?')
+    .bind(env.now() - 60_000)
+    .run();
+  const meta = (res as { meta?: { changes?: number } }).meta;
+  return typeof meta?.changes === 'number' ? meta.changes : 0;
 }
 
 export function authMessage(handle: string, challenge: string, method: string, path: string, rawBody: string | null): string {
@@ -152,8 +167,20 @@ export async function authenticate(
     return { ok: false, res: err(401, 'SIG_INVALID', 'Ed25519 signature did not verify for this handle, challenge, method, path and body.') };
   }
 
-  // Single use: burn the challenge only after a successful verification.
-  await env.DB.prepare('DELETE FROM auth_challenges WHERE handle = ? AND challenge = ?').bind(handle, challenge).run();
+  // Single use: burn the challenge only after a successful verification, and
+  // make the burn ATOMIC. Checking then deleting left a check-then-act window
+  // in which two concurrent copies of the same signed request could both pass
+  // the SELECT and both be accepted, breaking the single-use invariant the
+  // whole scheme rests on. DELETE ... RETURNING makes exactly one of them win:
+  // whoever gets a row burned it, everyone else loses the race and is refused.
+  const burned = await env.DB
+    .prepare('DELETE FROM auth_challenges WHERE handle = ? AND challenge = ? RETURNING challenge')
+    .bind(handle, challenge)
+    .first<{ challenge: string }>();
+  if (!burned) {
+    await logAuthFailure(env, handle, 'challenge_race_lost');
+    return { ok: false, res: err(401, 'CHALLENGE_SPENT', 'Challenge unknown, already used, or expired. Challenges are single-use; fetch a new one.') };
+  }
 
   if (agent) return { ok: true, ctx: { agent, challenge } };
   // Registration path: synthesize a minimal context; the caller creates the row.
