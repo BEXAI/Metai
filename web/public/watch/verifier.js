@@ -2181,6 +2181,64 @@ function hashState(state) {
   return hashJson(state);
 }
 
+// src/kernel/types.ts
+function playerId(seat) {
+  return `p${seat}`;
+}
+function isRuleError(x) {
+  return typeof x === "object" && x !== null && x.error === true;
+}
+function isParseError(x) {
+  return typeof x === "object" && x !== null && x.parseError === true;
+}
+
+// src/kernel/move.ts
+function resolveSubmittedMove(game, state, player, submission) {
+  const raw = submission.move;
+  let move;
+  if (typeof raw === "object" && raw !== null) {
+    const index = raw.index;
+    if (!Number.isInteger(index) || index < 0) {
+      return { ok: false, reason: "bad_index_type", via: "index" };
+    }
+    const legal = game.legalMoves(state, player);
+    const chosen = legal[index];
+    if (chosen === void 0) {
+      return {
+        ok: false,
+        reason: "index_out_of_range",
+        via: "index",
+        index,
+        legalCount: legal.length
+      };
+    }
+    move = chosen;
+  } else if (typeof raw === "string") {
+    const hash = /^#(\d+)$/.exec(raw.trim());
+    if (hash) {
+      const index = Number(hash[1]);
+      const legal = game.legalMoves(state, player);
+      const chosen = legal[index];
+      if (chosen === void 0) {
+        return { ok: false, reason: "index_out_of_range", via: "hash", index, legalCount: legal.length };
+      }
+      move = chosen;
+    } else {
+      const parsed = game.parseMove(raw, state, player);
+      if (isParseError(parsed)) {
+        return { ok: false, reason: "parse_error", notation: raw, parseMessage: parsed.message };
+      }
+      move = parsed;
+    }
+  } else {
+    return { ok: false, reason: "bad_move_shape" };
+  }
+  if (game.bindUtterance && typeof submission.utterance === "string" && submission.utterance.length > 0) {
+    move = game.bindUtterance(move, submission.utterance, state, player);
+  }
+  return { ok: true, move };
+}
+
 // node_modules/@noble/hashes/esm/hmac.js
 var HMAC = class extends Hash {
   constructor(hash, _key) {
@@ -2330,19 +2388,8 @@ var COMMIT_PREFIX = "ludus.commit.v1";
 var SEED_PREFIX = "ludus.seed.v1";
 var MOVE_SIGN_PREFIX = "ludus.move.v1";
 
-// src/kernel/types.ts
-function playerId(seat) {
-  return `p${seat}`;
-}
-function isRuleError(x) {
-  return typeof x === "object" && x !== null && x.error === true;
-}
-function isParseError(x) {
-  return typeof x === "object" && x !== null && x.parseError === true;
-}
-
 // src/kernel/verify.ts
-var STATE_KINDS = /* @__PURE__ */ new Set(["move", "timeout"]);
+var STATE_KINDS = /* @__PURE__ */ new Set(["move", "timeout", "forfeit"]);
 var SIGNED_KINDS = /* @__PURE__ */ new Set(["move", "resign", "draw_offer", "draw_accept"]);
 var CAUSE_KINDS = /* @__PURE__ */ new Set(["resign", "forfeit", "adjudication", "draw_accept"]);
 function asObj(x) {
@@ -2352,41 +2399,21 @@ function jsonEq(a, b) {
   return canonicalJson(a) === canonicalJson(b);
 }
 function resolveMove(game, state, player, payload, sub) {
-  const raw = sub.move;
-  let move;
-  if (typeof raw === "string") {
-    const hashIdx = /^#(\d+)$/.exec(raw.trim());
-    if (hashIdx) {
-      const idx = Number(hashIdx[1]);
-      const legal = game.legalMoves(state, player);
-      const picked = legal[idx];
-      if (picked === void 0) {
-        return { ok: false, detail: `submission index #${idx} out of range (${legal.length} legal moves)` };
-      }
-      move = picked;
-    } else {
-      const parsed = game.parseMove(raw, state, player);
-      if (isParseError(parsed)) {
-        return { ok: false, detail: `submission notation '${raw}' did not parse: ${parsed.message}` };
-      }
-      move = parsed;
+  const r = resolveSubmittedMove(game, state, player, sub);
+  if (!r.ok) {
+    if (r.reason === "index_out_of_range") {
+      const shown = r.via === "hash" ? `#${r.index}` : String(r.index);
+      return { ok: false, detail: `submission index ${shown} out of range (${r.legalCount} legal moves)` };
     }
-  } else {
-    const idxObj = asObj(raw);
-    if (!idxObj || typeof idxObj.index !== "number") {
-      return { ok: false, detail: "submission.move is neither a notation string nor { index }" };
+    if (r.reason === "parse_error") {
+      return { ok: false, detail: `submission notation '${r.notation}' did not parse: ${r.parseMessage}` };
     }
-    const legal = game.legalMoves(state, player);
-    const picked = legal[idxObj.index];
-    if (picked === void 0) {
-      return { ok: false, detail: `submission index ${idxObj.index} out of range (${legal.length} legal moves)` };
-    }
-    move = picked;
+    return { ok: false, detail: "submission.move is neither a notation string nor { index }" };
   }
-  if (payload.move !== void 0 && !jsonEq(payload.move, move)) {
+  if (payload.move !== void 0 && !jsonEq(payload.move, r.move)) {
     return { ok: false, detail: "payload.move disagrees with the move resolved from the signed submission" };
   }
-  return { ok: true, move };
+  return { ok: true, move: r.move };
 }
 function verifyReplay(replay, games) {
   const checks = [];
@@ -2514,6 +2541,30 @@ function verifyReplay(replay, games) {
       return `start.ruleset_version '${String(startP.ruleset_version)}' != replay.ruleset_version '${replay.ruleset_version}'`;
     }
     for (const e of replay.log) {
+      if (e.kind === "forfeit") {
+        const fp = asObj(e.payload);
+        if (!fp) return `entry ${e.seq} (forfeit): payload is not an object`;
+        if (fp.state_hash === void 0) continue;
+        const fplayer = typeof fp.player === "string" ? fp.player : null;
+        if (fplayer === null) return `entry ${e.seq} (forfeit): payload.player missing`;
+        if (!game.forfeitPlayer) {
+          return `entry ${e.seq}: forfeit carries state_hash but the game module has no forfeitPlayer`;
+        }
+        const beforeF = seed.draws().length;
+        const out = game.forfeitPlayer(state, fplayer);
+        if (out === null) return `entry ${e.seq}: forfeitPlayer returned null for a logged elimination`;
+        state = out.state;
+        if (fp.state_hash !== hashState(state)) {
+          return `entry ${e.seq}: state_hash does not match the recomputed state`;
+        }
+        if (!jsonEq(seed.draws().slice(beforeF), fp.draws ?? [])) {
+          return `entry ${e.seq}: logged draws differ from the recomputed seed draws`;
+        }
+        if (!jsonEq(fp.events ?? [], out.events)) {
+          return `entry ${e.seq}: logged events differ from the recomputed forfeitPlayer() events`;
+        }
+        continue;
+      }
       if (!STATE_KINDS.has(e.kind)) continue;
       const p = asObj(e.payload);
       if (!p) return `entry ${e.seq} (${e.kind}): payload is not an object`;
@@ -2557,6 +2608,9 @@ function verifyReplay(replay, games) {
       const applied = game.apply(state, player, move, seed);
       if (isRuleError(applied)) {
         return `entry ${e.seq}: apply rejected the logged move '${notation}' (${applied.code}: ${applied.message})`;
+      }
+      if (!jsonEq(p.events ?? [], applied.events)) {
+        return `entry ${e.seq}: logged events differ from the recomputed apply() events`;
       }
       state = applied.state;
       const loggedNotation = e.kind === "move" ? p.notation : p.applied_notation;

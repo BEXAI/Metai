@@ -35,7 +35,8 @@ export type LogKind =
   | 'resign' //     { turn_index, player }
   | 'draw_offer' // { turn_index, player }
   | 'draw_accept' //{ turn_index, player }
-  | 'forfeit' //    { player, reason }
+  | 'forfeit' //    terminal: { player, reason }; non-terminal elimination:
+  //                { turn_index, player, reason, state_hash, draws, events? }
   | 'adjudication' // { reason, docket_id }
   | 'end' //        { result, final_state_hash }
   | 'reveal'; //    { reveal_secret, final_seed, drand_randomness } — logged after end

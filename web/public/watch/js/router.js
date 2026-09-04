@@ -50,7 +50,23 @@ function matchRoute(path) {
   return null;
 }
 
+/**
+ * Bumped on every navigation. A page whose mount is async (game.js fetches the
+ * row before it can tell a board game from the werewolf theater) can resolve
+ * after the user has already navigated on; without this the stale page would
+ * overwrite `current` and never be disposed.
+ */
+let generation = 0;
+
+/** Replaces everything under the mount point with `host` (or empties it). */
+function swapIn(host) {
+  if (!mountEl) return;
+  while (mountEl.firstChild) mountEl.removeChild(mountEl.firstChild);
+  if (host) mountEl.appendChild(host);
+}
+
 async function renderCurrent() {
+  const gen = ++generation;
   if (current && typeof current.dispose === 'function') {
     try {
       current.dispose();
@@ -65,14 +81,37 @@ async function renderCurrent() {
   markActiveNav(path);
 
   if (!matched) {
+    swapIn(null);
     if (notFoundRenderer) {
       const result = notFoundRenderer(mountEl, { path, query });
       current = result && typeof result.dispose === 'function' ? result : { dispose: () => {} };
     }
     return;
   }
-  const result = await matched.mount(mountEl, matched.params, query);
-  current = result && typeof result.dispose === 'function' ? result : { dispose: () => {} };
+  // Async pages mount into a DETACHED host and are attached only if this render
+  // is still the current one. Bumping `generation` alone was not enough: a page
+  // paints inside its own mount (mountClassic clears the container and renders),
+  // so a slow game-row fetch could repaint over the page the user had already
+  // navigated to and only THEN be disposed — leaving a frozen, dead page on
+  // screen with the nav highlighting somewhere else. Mounting off-document also
+  // means the outgoing page stays visible for the round trip instead of the
+  // mount point going blank the moment a navigation starts.
+  const host = document.createElement('div');
+  const result = await matched.mount(host, matched.params, query);
+  const page = result && typeof result.dispose === 'function' ? result : { dispose: () => {} };
+  if (gen !== generation) {
+    // Navigated away while this page was still mounting: tear it down now
+    // rather than leaving its timers and subscriptions running untracked. Its
+    // DOM was never attached, so there is nothing on screen to undo.
+    try {
+      page.dispose();
+    } catch {
+      /* page cleanup should never crash navigation */
+    }
+    return;
+  }
+  swapIn(host);
+  current = page;
 }
 
 function markActiveNav(path) {

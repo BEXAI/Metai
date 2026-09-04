@@ -18,6 +18,12 @@
   --seat-3: #d97fb0;
   --seat-4: #b98cf0;
   --seat-5: #f08a5d;
+  /* Werewolf seats 8 seats, so the palette had to reach 8. These two fill the
+     empty cyan (~176deg) and yellow-green (~71deg) gaps in the existing wheel.
+     Seat colours live only in :root — the light blocks below never restate
+     them — so these follow that pattern exactly. */
+  --seat-6: #3fc6bd;
+  --seat-7: #b3cf4a;
   --ok: #6fd68f;
   --bad: #e2685f;
   --warn: #e2b04a;
@@ -417,6 +423,8 @@ table.data-table tbody tr:hover {
 .piece-seat-3 { fill: var(--seat-3); }
 .piece-seat-4 { fill: var(--seat-4); }
 .piece-seat-5 { fill: var(--seat-5); }
+.piece-seat-6 { fill: var(--seat-6); }
+.piece-seat-7 { fill: var(--seat-7); }
 
 .disc { stroke: #10141c; stroke-width: 1.5; }
 .checkers-piece .disc-king-ring { fill: none; stroke: #d8b23a; stroke-width: 3; }
@@ -566,4 +574,394 @@ button:hover {
 }
 .step-controls input[type='range'] {
   flex: 1 1 auto;
+}
+
+/* ==========================================================================
+   Werewolf transcript theater (#/werewolf/:id, js/pages/werewolf.js)
+
+   The palette below is deliberately drawn from OUTSIDE the seat/status hues.
+   In this one UI a hue simultaneously encodes seat identity, role and act
+   type, so a seer badge painted the same colour as seat p4 is a real defect,
+   not a nitpick. Nothing here may equal --seat-0..7, --ok, --bad, --warn,
+   --accent or --accent-strong; web/tests asserts it.
+
+   Colour is never the only channel: every seat is always labelled with its
+   seat id as text, and every state (dead / silent / timed out / sealed /
+   false claim) carries a word as well as a colour.
+   ========================================================================== */
+
+:root {
+  --ww-night-bg: #080c17;
+  --ww-night-panel: #0d1322;
+  --ww-day-bg: #171f31;
+  --ww-day-panel: #1e2740;
+  --ww-vote-bg: #201a2e;
+  --ww-wolf: #d1524a;
+  --ww-village: #4f93d9;
+  --ww-seer: #8f6ad4;
+  --ww-doctor: #3fa88b;
+  --ww-accuse: #cf5a4e;
+  --ww-defend: #4fa877;
+  --ww-report: #c99a2e;
+  --ww-dead-fg: #6a7488;
+  --ww-seal: #7a6fc4;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --ww-night-bg: #e4e7f2;
+    --ww-night-panel: #eceffa;
+    --ww-day-bg: #fbfaf3;
+    --ww-day-panel: #ffffff;
+    --ww-vote-bg: #f2edfa;
+    --ww-wolf: #b03127;
+    --ww-village: #245c99;
+    --ww-seer: #6440ad;
+    --ww-doctor: #1f7a61;
+    --ww-accuse: #a83b30;
+    --ww-defend: #2b7a4f;
+    --ww-report: #916a10;
+    --ww-dead-fg: #79839a;
+    --ww-seal: #55499b;
+  }
+}
+
+:root[data-theme='dark'] {
+  --ww-night-bg: #080c17;
+  --ww-night-panel: #0d1322;
+  --ww-day-bg: #171f31;
+  --ww-day-panel: #1e2740;
+  --ww-vote-bg: #201a2e;
+  --ww-wolf: #d1524a;
+  --ww-village: #4f93d9;
+  --ww-seer: #8f6ad4;
+  --ww-doctor: #3fa88b;
+  --ww-accuse: #cf5a4e;
+  --ww-defend: #4fa877;
+  --ww-report: #c99a2e;
+  --ww-dead-fg: #6a7488;
+  --ww-seal: #7a6fc4;
+}
+
+:root[data-theme='light'] {
+  --ww-night-bg: #e4e7f2;
+  --ww-night-panel: #eceffa;
+  --ww-day-bg: #fbfaf3;
+  --ww-day-panel: #ffffff;
+  --ww-vote-bg: #f2edfa;
+  --ww-wolf: #b03127;
+  --ww-village: #245c99;
+  --ww-seer: #6440ad;
+  --ww-doctor: #1f7a61;
+  --ww-accuse: #a83b30;
+  --ww-defend: #2b7a4f;
+  --ww-report: #916a10;
+  --ww-dead-fg: #79839a;
+  --ww-seal: #55499b;
+}
+
+/* The theater wants more than the 1200px shell. classList is not an inline
+   style, so widening the ancestor from the page is legal under the CSP grep. */
+body.ww-theater-page main#app { max-width: 1520px; }
+
+/* --- shell ---------------------------------------------------------------- */
+
+.ww-theater {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 0.85rem;
+  transition: background-color 900ms ease, border-color 900ms ease;
+}
+.ww-theater.is-night { background: var(--ww-night-bg); }
+.ww-theater.is-day_talk,
+.ww-theater.is-day_defense { background: var(--ww-day-bg); }
+.ww-theater.is-day_vote { background: var(--ww-vote-bg); }
+.ww-theater.is-over { background: var(--bg-panel); }
+
+.ww-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem 0.9rem;
+  padding-bottom: 0.6rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 0.85rem;
+}
+.ww-banner-tags { display: flex; gap: 0.35rem; }
+.ww-banner-line { font-weight: 700; letter-spacing: 0.02em; }
+/* The ONLY live region on the page. index.html's <main aria-live="polite">
+   is switched off for the theater subtree so an appending transcript,
+   a repainting timeline and a per-beat label do not become a screen-reader
+   firehose; this strip announces phase transitions and nothing else. */
+.ww-status-strip {
+  margin: 0;
+  flex: 1 1 100%;
+  font-size: 0.82rem;
+  color: var(--fg-dim);
+}
+
+.ww-layout {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  gap: 1rem;
+  align-items: start;
+}
+.ww-panel { background: var(--bg-panel); }
+.ww-theater.is-night .ww-panel { background: var(--ww-night-panel); }
+.ww-theater.is-day_talk .ww-panel,
+.ww-theater.is-day_defense .ww-panel { background: var(--ww-day-panel); }
+
+/* --- roster --------------------------------------------------------------- */
+
+.ww-roster { list-style: none; margin: 0; padding: 0; }
+.ww-roster-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.4rem;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.86rem;
+}
+.ww-roster-row.is-dead { color: var(--ww-dead-fg); }
+.ww-roster-row.is-dead .ww-speaker { text-decoration: line-through; }
+.ww-swatch {
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 3px;
+  display: inline-block;
+  flex: 0 0 auto;
+}
+.ww-roster-state { color: var(--fg-dim); font-size: 0.78rem; margin-left: auto; }
+.ww-role-badge {
+  flex: 1 1 100%;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+.ww-role-werewolf { color: var(--ww-wolf); }
+.ww-role-seer { color: var(--ww-seer); }
+.ww-role-doctor { color: var(--ww-doctor); }
+.ww-role-villager { color: var(--ww-village); }
+
+/* --- the seal ------------------------------------------------------------- */
+
+.ww-seal-note { display: block; margin: 0 0 0.6rem; line-height: 1.45; }
+.ww-truth-btn:disabled { cursor: not-allowed; opacity: 0.6; }
+.ww-truth-legend { font-size: 0.8rem; color: var(--fg-dim); margin: 0.6rem 0 0; line-height: 1.5; }
+
+/* --- transcript ----------------------------------------------------------- */
+
+.ww-transcript-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.4rem;
+}
+.ww-transcript-head .section-title { margin: 0; }
+
+.ww-transcript { list-style: none; margin: 0; padding: 0; max-height: 62vh; overflow-y: auto; }
+.ww-utt {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.15rem;
+  padding: 0.5rem 0.4rem;
+  border-bottom: 1px solid var(--border);
+  border-left: 3px solid transparent;
+}
+.ww-utt-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.4rem; }
+.ww-speaker { font-family: var(--mono); font-weight: 700; }
+.ww-handle { color: var(--fg-dim); font-size: 0.8rem; }
+.ww-stamp { margin-left: auto; color: var(--fg-dim); font-family: var(--mono); font-size: 0.72rem; }
+.ww-utt .ww-speech { border-left-width: 3px; }
+
+.ww-chip {
+  display: inline-block;
+  padding: 0.05rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+.ww-chip-accuse { color: var(--ww-accuse); border-color: var(--ww-accuse); }
+.ww-chip-defend { color: var(--ww-defend); border-color: var(--ww-defend); }
+.ww-chip-claim { color: var(--ww-seer); border-color: var(--ww-seer); }
+/* The report chip is the highest-signal object in the game; it gets its own
+   accent so the eye finds every claimed check on a fast scroll. */
+.ww-chip-report {
+  color: var(--ww-report);
+  border-color: var(--ww-report);
+  background: color-mix(in srgb, var(--ww-report) 14%, transparent);
+}
+.ww-chip-defense { color: var(--fg); border-color: var(--fg-dim); }
+.ww-chip-ballot { color: var(--fg-dim); }
+.ww-chip-silent { color: var(--ww-dead-fg); border-style: dashed; }
+/* A TIMEOUT IS NOT A SILENCE. Same row shape, different word, different
+   colour, dedicated filter — "who stayed quiet on day 2" is evidence. */
+.ww-chip-timeout {
+  color: var(--ww-wolf);
+  border-color: var(--ww-wolf);
+  border-style: dashed;
+  font-family: var(--mono);
+}
+.ww-chip-seal { color: var(--ww-seal); border-color: var(--ww-seal); }
+.ww-chip-night { color: var(--ww-seal); border-style: dashed; }
+
+.ww-utt.ww-silent { padding-top: 0.25rem; padding-bottom: 0.25rem; opacity: 0.75; }
+.ww-utt.ww-timeout { background: color-mix(in srgb, var(--ww-wolf) 7%, transparent); }
+
+.ww-divider {
+  padding: 0.5rem 0.4rem;
+  margin-top: 0.35rem;
+  border-top: 1px solid var(--border);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  font-size: 0.85rem;
+}
+.ww-divider-night { color: var(--ww-seal); }
+.ww-divider-dawn { color: var(--ww-report); }
+.ww-divider-vote { color: var(--fg); }
+.ww-divider-defense { color: var(--ww-defend); }
+.ww-divider-lynch { color: var(--ww-accuse); }
+.ww-divider-lost { color: var(--ww-dead-fg); }
+.ww-divider-over { color: var(--fg); }
+
+/* --- ballot card ---------------------------------------------------------- */
+
+.ww-ballot-card {
+  padding: 0.6rem 0.5rem;
+  margin: 0.4rem 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-raised);
+}
+.ww-ballot-rows {
+  list-style: none;
+  margin: 0.4rem 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 0.15rem 0.6rem;
+}
+.ww-ballot-row { display: flex; gap: 0.35rem; font-size: 0.84rem; }
+.ww-ballot-arrow { color: var(--fg-dim); }
+.ww-tally { margin: 0.2rem 0; font-family: var(--mono); font-size: 0.8rem; color: var(--fg-dim); }
+.ww-outcome { margin: 0.2rem 0 0; font-weight: 700; font-size: 0.85rem; }
+.ww-outcome-plurality { color: var(--ww-accuse); }
+/* Strict plurality: ANY tie is no lynch. Never paint this as "pending". */
+.ww-outcome-tie,
+.ww-outcome-no_votes { color: var(--fg-dim); }
+
+/* --- truth overlay (post-game only; these nodes do not exist while live) --- */
+
+.ww-utt.ww-by-wolf { box-shadow: inset 3px 0 0 var(--ww-wolf); }
+.ww-utt.ww-sealed {
+  background: color-mix(in srgb, var(--ww-seal) 12%, transparent);
+  border-left-color: var(--ww-seal);
+}
+.ww-truth-chip {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+.ww-utt.ww-lie .ww-truth-chip,
+.ww-utt.ww-fake-report .ww-truth-chip,
+.ww-utt.ww-misdirect .ww-truth-chip { color: var(--ww-wolf); }
+.ww-utt.ww-pack-cover .ww-truth-chip { color: var(--ww-wolf); }
+.ww-utt.ww-true-report .ww-truth-chip,
+.ww-utt.ww-true-claim .ww-truth-chip { color: var(--ww-doctor); }
+.ww-utt.ww-anomaly .ww-truth-chip { color: var(--warn); }
+
+/* --- filters: class-driven, no re-render ---------------------------------- */
+
+.ww-transcript.filter-wolves .ww-utt:not(.ww-by-wolf) { display: none; }
+.ww-transcript.filter-lies .ww-utt:not(.ww-lie):not(.ww-fake-report):not(.ww-misdirect):not(.ww-pack-cover) { display: none; }
+.ww-transcript.filter-sealed .ww-utt:not(.ww-sealed) { display: none; }
+.ww-transcript.filter-timeouts .ww-utt:not(.ww-timeout) { display: none; }
+.ww-transcript.filter-silent .ww-utt:not(.ww-silent) { display: none; }
+.ww-transcript.filter-seat-0 .ww-utt:not(.ww-seat-0) { display: none; }
+.ww-transcript.filter-seat-1 .ww-utt:not(.ww-seat-1) { display: none; }
+.ww-transcript.filter-seat-2 .ww-utt:not(.ww-seat-2) { display: none; }
+.ww-transcript.filter-seat-3 .ww-utt:not(.ww-seat-3) { display: none; }
+.ww-transcript.filter-seat-4 .ww-utt:not(.ww-seat-4) { display: none; }
+.ww-transcript.filter-seat-5 .ww-utt:not(.ww-seat-5) { display: none; }
+.ww-transcript.filter-seat-6 .ww-utt:not(.ww-seat-6) { display: none; }
+.ww-transcript.filter-seat-7 .ww-utt:not(.ww-seat-7) { display: none; }
+
+/* Beats after the scrub position. The scrub pass FAILS CLOSED — a node with
+   no finite data-beat gets .is-future — so a missing beat hides a row rather
+   than leaking the ending. */
+.ww-transcript .is-future { display: none; }
+
+/* --- timeline ------------------------------------------------------------- */
+
+.ww-timeline {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 0.85rem;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--border);
+}
+.ww-timeline input[type='range'] { flex: 1 1 auto; }
+.ww-beat-label { font-family: var(--mono); font-size: 0.78rem; color: var(--fg-dim); white-space: nowrap; }
+.ww-live-btn[hidden] { display: none; }
+
+/* --- seat colour families (numeric index ONLY; never a 'p3' seat id) ------ */
+
+.ww-fg-seat-0 { color: var(--seat-0); }
+.ww-fg-seat-1 { color: var(--seat-1); }
+.ww-fg-seat-2 { color: var(--seat-2); }
+.ww-fg-seat-3 { color: var(--seat-3); }
+.ww-fg-seat-4 { color: var(--seat-4); }
+.ww-fg-seat-5 { color: var(--seat-5); }
+.ww-fg-seat-6 { color: var(--seat-6); }
+.ww-fg-seat-7 { color: var(--seat-7); }
+
+.ww-bg-seat-0 { background: var(--seat-0); }
+.ww-bg-seat-1 { background: var(--seat-1); }
+.ww-bg-seat-2 { background: var(--seat-2); }
+.ww-bg-seat-3 { background: var(--seat-3); }
+.ww-bg-seat-4 { background: var(--seat-4); }
+.ww-bg-seat-5 { background: var(--seat-5); }
+.ww-bg-seat-6 { background: var(--seat-6); }
+.ww-bg-seat-7 { background: var(--seat-7); }
+
+.ww-utt.ww-seat-0 { border-left-color: var(--seat-0); }
+.ww-utt.ww-seat-1 { border-left-color: var(--seat-1); }
+.ww-utt.ww-seat-2 { border-left-color: var(--seat-2); }
+.ww-utt.ww-seat-3 { border-left-color: var(--seat-3); }
+.ww-utt.ww-seat-4 { border-left-color: var(--seat-4); }
+.ww-utt.ww-seat-5 { border-left-color: var(--seat-5); }
+.ww-utt.ww-seat-6 { border-left-color: var(--seat-6); }
+.ww-utt.ww-seat-7 { border-left-color: var(--seat-7); }
+
+/* --- responsive ----------------------------------------------------------- */
+
+@media (max-width: 1023px) {
+  .ww-layout { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 760px) {
+  /* Drop the inner scroll so the page scrolls once instead of nesting two
+     scroll containers on a phone. */
+  .ww-transcript { max-height: none; overflow: visible; }
+  .ww-stamp { margin-left: 0; flex: 1 1 100%; }
+  .ww-timeline { flex-wrap: wrap; }
+}
+
+/* Every animation and transition here ends in the CORRECT final DOM, so
+   turning them all off changes nothing but the journey. */
+@media (prefers-reduced-motion: reduce) {
+  .ww-theater,
+  .ww-theater *,
+  .ww-theater *::before,
+  .ww-theater *::after {
+    animation: none !important;
+    transition: none !important;
+  }
 }

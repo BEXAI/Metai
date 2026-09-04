@@ -23,6 +23,12 @@ export interface BuildViewOptions {
   rulesCard: string;
   /** Cap for shipped legal moves; beyond it games must provide legalMovesPaged. */
   maxMoves?: number;
+  /**
+   * How many of the most recent history rows to ship. Default 20; rooms source
+   * it from meta.historyWindow. 0 ships none — do not "simplify" the guard
+   * below into a bare slice(-n): slice(-0) returns the WHOLE array.
+   */
+  historyLimit?: number;
 }
 
 export function legalMoveEntries(game: AnyGame, state: Json, player: PlayerId): LegalMoveEntry[] {
@@ -52,7 +58,8 @@ export function buildView(game: AnyGame, state: Json, player: PlayerId, opts: Bu
     game.meta.information === 'hidden'
       ? (game.viewStateString?.(state, player) ?? '')
       : game.encodeState(state);
-  return {
+  const historyLimit = opts.historyLimit ?? 20;
+  const view: ViewObject = {
     game_id: opts.gameId,
     you: { player, seat: seatIndex(player) },
     to_move: game.playersToMove(state),
@@ -64,8 +71,16 @@ export function buildView(game: AnyGame, state: Json, player: PlayerId, opts: Bu
     public: game.publicView(state),
     private: game.privateView(state, player),
     legal_moves: entries.slice(0, maxMoves),
-    history: opts.history.slice(-20),
+    history: historyLimit <= 0 ? [] : opts.history.slice(-historyLimit),
     rules_card: opts.rulesCard,
     boundary: CONTENT_BOUNDARY,
   };
+  // Speech games only. The KEY is assigned only when the game implements the
+  // hook, so the serialised view of a game without one is byte-identical to
+  // what it was before these fields existed.
+  const speech = game.speechInfo?.(state, player);
+  if (speech) view.speech = speech;
+  const privateMessages = game.privateMessages?.(state, player);
+  if (privateMessages) view.private_messages = privateMessages;
+  return view;
 }

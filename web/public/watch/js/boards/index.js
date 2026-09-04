@@ -9,6 +9,7 @@ import * as morris from './morris.js';
 import * as chineseCheckers from './chinese_checkers.js';
 import * as backgammon from './backgammon.js';
 import * as schematic from './schematic.js';
+import * as werewolf from './werewolf.js';
 import { renderFallback } from './common.js';
 
 const GRID_GAMES = new Set(['chess', 'checkers', 'reversi', 'connect_drop', 'tictactoe']);
@@ -35,6 +36,12 @@ export function renderBoard(container, gameId, view) {
       ok = backgammon.render(container, view);
     } else if (gameId === 'landlord' || gameId === 'islanders') {
       ok = schematic.render(container, gameId, view);
+    } else if (gameId === 'werewolf') {
+      // Not through schematic.js: that appends board_text under the board, and
+      // for werewolf board_text is the whole engine dossier — the same content
+      // twice under every mini-board. The fallback below still prints it if
+      // the renderer declines the shape.
+      ok = werewolf.render(container, view);
     }
     if (!ok) renderFallback(container, view);
   } catch {

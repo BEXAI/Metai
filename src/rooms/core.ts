@@ -26,8 +26,21 @@
  *  - 'resign' / 'draw_offer' / 'draw_accept' payloads carry the full signed
  *    `submission` in addition to { turn_index, player } so the Ed25519
  *    signature (over the frozen move message) is verifiable offline.
+ *  - 'forfeit' has TWO shapes. Terminal forfeit (a game with no
+ *    game.forfeitPlayer — every board game) logs { player, reason } and the
+ *    game ends, exactly as it always has. Non-terminal ELIMINATION (the game
+ *    converted the loss with forfeitPlayer) logs a full state entry
+ *    { turn_index, player, reason, state_hash, draws, events? } and play
+ *    continues with the remaining seats. Both are unsigned. verify.ts tells
+ *    them apart on the presence of `state_hash`.
  *  - Every strike is its own 'strike' entry appended right after the entry
  *    that caused it ('timeout' or forced 'move').
+ *
+ * TWO FIELDS THE LIVE PUBLIC FEED WITHHOLDS IN A HIDDEN-INFORMATION GAME —
+ * `state_hash` and `commentary`. Both are logged exactly as before; only the
+ * live spectator echo is gated. See publishesStateHash() and
+ * commentaryIsPublicIn() for why each one is an information leak that no
+ * amount of redaction elsewhere survives.
  */
 
 import { bytesToHex } from '@noble/hashes/utils';
@@ -37,6 +50,7 @@ import { deriveFinalSeed, makeCommitment } from '../crypto/commit.ts';
 import { roundTimeMs } from '../crypto/drand.ts';
 import { verifyEd25519 } from '../crypto/ed25519.ts';
 import { hashState } from '../kernel/hash.ts';
+import { resolveSubmittedMove } from '../kernel/move.ts';
 import {
   MOVE_SIGN_PREFIX,
   type LogEntry,
@@ -46,7 +60,6 @@ import {
 import { createSeedStream } from '../kernel/seed.ts';
 import { buildView, legalMoveEntries } from '../kernel/view.ts';
 import {
-  isParseError,
   isRuleError,
   type AnyGame,
   type GameEvent,
@@ -76,6 +89,14 @@ function iso(nowMs: number): string {
 }
 
 const MAX_COMMENTARY = 280;
+
+/**
+ * Cap on a notation-string `move`. Speech games carry their words inside the
+ * notation, so the field is no longer a handful of characters — but it is
+ * still bounded, and an unbounded one would be parsed, hashed and logged.
+ * This is a REJECTION, never a strike: reject() does not touch illegalThisTurn.
+ */
+const MAX_MOVE_CHARS = 2_000;
 
 /**
  * How many recent turns of per-seat private views the room retains (memory,
@@ -540,6 +561,12 @@ export class RoomCore {
       deadlineUtc: this.snap.deadlineAtMs === null ? iso(nowMs) : iso(this.snap.deadlineAtMs),
       history: this.snap.history,
       rulesCard: this.snap.rulesCard,
+      // Games with a wider transcript than buildView's default 20 rows say so
+      // in meta.historyWindow. The key is passed only when the game sets it,
+      // so every other game gets the default and a byte-identical view.
+      ...(typeof this.game.meta.historyWindow === 'number'
+        ? { historyLimit: this.game.meta.historyWindow }
+        : {}),
     });
   }
 
@@ -591,6 +618,49 @@ export class RoomCore {
   }
 
   /**
+   * Whether the LIVE public `move`/`timeout` event may carry `state_hash`.
+   *
+   * It may not in a hidden-information game. `state_hash` is sha256 over the
+   * WHOLE state, hidden fields included, and a small hidden search space makes
+   * that a brute-forceable oracle: werewolf deals 8 seats from a PUBLISHED
+   * composition, which is 840 possibilities, so one hash from the
+   * unauthenticated event feed plus the `start` event's seat list recovers the
+   * entire role map before a word is spoken. No amount of redaction elsewhere
+   * survives publishing a digest of the thing being redacted.
+   *
+   * VERIFICATION IS UNAFFECTED. kernel/verify.ts reads `state_hash` out of the
+   * LOG entry payloads, never out of a spectator event, and the log is withheld
+   * (409) until the game has ended — at which point the reveal makes the hidden
+   * state public anyway. So the hash is still logged for every game, on every
+   * entry, exactly as before; only the LIVE echo of it is withheld.
+   */
+  private publishesStateHash(): boolean {
+    return this.game.meta.information !== 'hidden';
+  }
+
+  /**
+   * Whether an agent's `commentary` may ride on the shared history row and the
+   * public `move` event for a move made in `preState`.
+   *
+   * The night redaction is the whole hidden-role mechanism, and it operates on
+   * ONE field: the notation. `commentary` sits in the same history row, is
+   * shipped to every other seat by kernel/view.ts with no viewer filter, and is
+   * stamped onto the public spectator event — so a wolf narrating its kill in
+   * `commentary` publishes the pack (its partner's secret as well as its own)
+   * next to a notation that says `night`. The prompt offers commentary as "an
+   * aside to spectators" in the same breath as speech.audience says the night
+   * words reach the pack only, which is an invitation to exactly that mistake.
+   *
+   * So commentary is gated the same way speech is: it survives only in a phase
+   * whose speech channel is addressed to everyone. A game with no speechInfo
+   * hook (the twelve board games) is unaffected — audience defaults to public.
+   */
+  private commentaryIsPublicIn(preState: Json, player: PlayerId): boolean {
+    const speech = this.game.speechInfo?.(preState, player);
+    return speech === undefined || speech.audience === 'village';
+  }
+
+  /**
    * Records every seat's private view of the CURRENT state under the current
    * turn index, pruning turns older than PV_RETAIN_TURNS so the map (and its
    * persisted form) stays bounded on arbitrarily long games.
@@ -626,8 +696,21 @@ export class RoomCore {
     return this.snap.status === 'ended';
   }
 
+  /**
+   * The per-move budget for the CURRENT phase. Games whose phases differ in
+   * length (a 60 s night vs a 150 s discussion) override it through
+   * game.phaseBudgetMs; every other game returns the room's flat perMoveMs.
+   *
+   * The hook belongs here and not in startTurnClock, because budgetMs() is
+   * also what a timeout CHARGES to the cumulative clock (the simultaneous and
+   * sequential timeout paths below) and what flagFallen() compares against the
+   * side budget. Patching only the deadline would set a 60 s night deadline
+   * while charging 150 s to the seat that missed it.
+   */
   private budgetMs(): number {
-    return Math.max(1, Math.round(this.snap.clocks.perMoveMs * this.snap.clocks.clock_scale));
+    const phase = this.game.phaseBudgetMs?.(this.snap.state);
+    const base = typeof phase === 'number' && phase > 0 ? phase : this.snap.clocks.perMoveMs;
+    return Math.max(1, Math.round(base * this.snap.clocks.clock_scale));
   }
 
   /** Scaled cumulative side budget (spec games.*.clock), or null when uncapped. */
@@ -710,6 +793,32 @@ export class RoomCore {
         return this.reject(nowMs, agentId, 'bad_commentary', `commentary must be a string of at most ${MAX_COMMENTARY} chars`);
       }
     }
+    // In-game speech (part of the MOVE, unlike commentary) is accepted only by
+    // games that declare a channel, and only up to that game's limit — the
+    // bound text goes into the move object, the state hash and the replay.
+    if (submission.utterance !== undefined) {
+      const limit = this.game.meta.speechLimit;
+      if (typeof limit !== 'number') {
+        return this.reject(nowMs, agentId, 'bad_utterance', 'this game has no speech channel');
+      }
+      if (typeof submission.utterance !== 'string') {
+        return this.reject(nowMs, agentId, 'bad_utterance', 'utterance must be a string');
+      }
+      if (submission.utterance.length > limit) {
+        return this.reject(nowMs, agentId, 'bad_utterance', `utterance must be at most ${limit} chars`);
+      }
+    }
+    if (typeof submission.move === 'string' && submission.move.length > MAX_MOVE_CHARS) {
+      return this.reject(nowMs, agentId, 'move_too_long', `move notation must be at most ${MAX_MOVE_CHARS} chars`);
+    }
+
+    // Games where a lone seat cannot end the table (meta.allowsResign false)
+    // reject the request outright. This gate must precede the resign branch,
+    // which itself precedes the mover check — so without it ANY seated player,
+    // including one the game has already eliminated, crowns every other seat.
+    if (submission.resign === true && this.game.meta.allowsResign === false) {
+      return this.reject(nowMs, agentId, 'resign_unavailable', 'resignation is not available in this game');
+    }
 
     // Resignation is a signed log entry, allowed from any seated player.
     if (submission.resign === true) {
@@ -741,6 +850,15 @@ export class RoomCore {
       return this.reject(nowMs, agentId, 'not_your_turn', `it is not ${player}'s turn`);
     }
 
+    // Games with no negotiated draw (meta.allowsDrawOffer false) reject both
+    // halves here — the ACCEPT branch below runs before the simultaneous-phase
+    // rejection further down, and an offer registered in a one-mover phase is
+    // acceptable by any other seat on the next turn, so two seats could
+    // otherwise agree a `winners: []` draw the verifier accepts as clean.
+    if (submission.draw_offer === true && this.game.meta.allowsDrawOffer === false) {
+      return this.reject(nowMs, agentId, 'draw_offer_unavailable', 'draw offers are not available in this game');
+    }
+
     // Draw accept: a pending offer from another player, valid exactly for this turn.
     const offer = this.snap.pendingDrawOffer;
     if (submission.draw_offer === true && offer !== null && offer.by !== player && offer.validAtTurn === this.snap.turnIndex) {
@@ -766,33 +884,27 @@ export class RoomCore {
   /**
    * Resolves the submitted move against the current state. Returns either the
    * move or an illegal-move description (which feeds the three-step policy).
+   *
+   * The ladder itself lives in kernel/move.ts so the offline verifier resolves
+   * a logged submission through the very same code — a room/verifier drift
+   * here would surface months later as a replay that reports as tampered. The
+   * helper returns a DISCRIMINATED failure rather than a message, because the
+   * two call sites word the same failure differently and those strings are
+   * part of the frozen agent-facing protocol; the wording below is verbatim
+   * what this room has always produced.
    */
   private resolveMove(
     submission: MoveSubmission,
     player: PlayerId,
   ): { move: Json } | { illegal: string } {
-    const state = this.snap.state;
-    const m = submission.move;
-    if (typeof m === 'object' && m !== null) {
-      if (!Number.isInteger(m.index) || m.index < 0) return { illegal: `move.index must be a non-negative integer` };
-      const legal = this.game.legalMoves(state, player);
-      const chosen = legal[m.index];
-      if (chosen === undefined) return { illegal: `index ${m.index} is out of range: ${legal.length} legal moves` };
-      return { move: chosen };
+    const r = resolveSubmittedMove(this.game, this.snap.state, player, submission);
+    if (r.ok) return { move: r.move };
+    if (r.reason === 'bad_index_type') return { illegal: `move.index must be a non-negative integer` };
+    if (r.reason === 'index_out_of_range') {
+      return { illegal: `index ${r.index} is out of range: ${r.legalCount} legal moves` };
     }
-    if (typeof m !== 'string') return { illegal: 'move must be a notation string or { index }' };
-    // Kernel-level index fallback: '#7' means legal_moves[7].
-    const hash = /^#(\d+)$/.exec(m.trim());
-    if (hash) {
-      const idx = Number(hash[1]);
-      const legal = this.game.legalMoves(state, player);
-      const chosen = legal[idx];
-      if (chosen === undefined) return { illegal: `index ${idx} is out of range: ${legal.length} legal moves` };
-      return { move: chosen };
-    }
-    const parsed = this.game.parseMove(m, state, player);
-    if (isParseError(parsed)) return { illegal: `cannot parse '${m}': ${parsed.message}` };
-    return { move: parsed };
+    if (r.reason === 'bad_move_shape') return { illegal: 'move must be a notation string or { index }' };
+    return { illegal: `cannot parse '${r.notation}': ${r.parseMessage}` };
   }
 
   /**
@@ -859,8 +971,13 @@ export class RoomCore {
       // or applied, matching the simultaneous path, so a striker can never be
       // crowned by their own forced game-ending move.
       if ((this.snap.strikes[player] ?? 0) >= 2) {
-        this.recordStrike(nowMs, player, 'illegal_move', this.snap.turnIndex);
-        this.forfeit(nowMs, player);
+        const turn = this.snap.turnIndex;
+        this.recordStrike(nowMs, player, 'illegal_move', turn);
+        // Games with forfeitPlayer take the seat out and keep playing; the
+        // turn still has to advance, because nothing was applied at it and the
+        // survivors need a fresh deadline and a fresh illegal-attempt count.
+        if (!this.eliminate(nowMs, player, 'three_strikes')) return this.okResult(evStart, true);
+        this.advanceTurn(nowMs, turn);
         return this.okResult(evStart, true);
       }
       drawStart = this.seed.draws().length;
@@ -875,10 +992,13 @@ export class RoomCore {
       if (forced) throw new Error(`room ${this.snap.game_id}: forced random legal move rejected: ${applied.message}`);
       const outcome = this.illegalAttempt(nowMs, seat, `${applied.code}: ${applied.message}`);
       if ('rejection' in outcome) return outcome.rejection;
-      // Same third-strike rule as above: forfeit beats the forced move.
+      // Same third-strike rule as above: forfeit (or elimination) beats the
+      // forced move.
       if ((this.snap.strikes[player] ?? 0) >= 2) {
-        this.recordStrike(nowMs, player, 'illegal_move', this.snap.turnIndex);
-        this.forfeit(nowMs, player);
+        const turn = this.snap.turnIndex;
+        this.recordStrike(nowMs, player, 'illegal_move', turn);
+        if (!this.eliminate(nowMs, player, 'three_strikes')) return this.okResult(evStart, true);
+        this.advanceTurn(nowMs, turn);
         return this.okResult(evStart, true);
       }
       drawStart = this.seed.draws().length;
@@ -909,6 +1029,9 @@ export class RoomCore {
     const player = seat.player;
     const turn = this.snap.turnIndex;
     const notation = this.game.moveToNotation(move, this.snap.state);
+    // Read the speech audience off the PRE-move state: it describes the phase
+    // the seat actually spoke in, which this move may itself have ended.
+    const commentaryPublic = this.commentaryIsPublicIn(this.snap.state, player);
     this.snap.state = newState;
     const stateHash = hashState(newState);
 
@@ -947,7 +1070,7 @@ export class RoomCore {
     }
 
     const hist: HistoryEntry = { turnIndex: turn, player, notation };
-    if (!forced && typeof submission?.commentary === 'string' && submission.commentary.length > 0) {
+    if (!forced && commentaryPublic && typeof submission?.commentary === 'string' && submission.commentary.length > 0) {
       hist.commentary = submission.commentary;
     }
     this.snap.history.push(hist);
@@ -958,10 +1081,10 @@ export class RoomCore {
       player,
       agent_id: seat.agent_id,
       notation,
-      state_hash: stateHash,
       public: this.game.publicView(this.snap.state),
       board_text: this.game.renderText(this.snap.state, null),
     };
+    if (this.publishesStateHash()) evData['state_hash'] = stateHash;
     if (hist.commentary !== undefined) evData['commentary'] = hist.commentary;
     if (forced) evData['forced'] = 'illegal';
     this.emit(nowMs, 'move', evData);
@@ -971,9 +1094,10 @@ export class RoomCore {
     // Three strikes forfeit BEFORE the terminal check runs (safety net; the
     // submit paths already forfeit third strikes without applying a move): a
     // striker must never be crowned by their own forced game-ending move.
+    // When the game eliminates instead of forfeiting, this move DID apply, so
+    // the turn advances exactly once, below, as it would have anyway.
     if (forced && (this.snap.strikes[player] ?? 0) >= 3) {
-      this.forfeit(nowMs, player);
-      return;
+      if (!this.eliminate(nowMs, player, 'three_strikes')) return;
     }
 
     this.advanceTurn(nowMs, turn);
@@ -1002,13 +1126,72 @@ export class RoomCore {
     this.emit(nowMs, 'strike', { turn_index: turn, player, reason, strike_count: count });
   }
 
-  /** 'three_strikes' = the frozen strike policy; 'time' = cumulative side clock exhausted (flag fall). */
+  /**
+   * TERMINAL forfeit: the losing seat is named and every other seat wins.
+   * 'three_strikes' = the frozen strike policy; 'time' = cumulative side clock
+   * exhausted (flag fall).
+   *
+   * This is the only outcome a game without `forfeitPlayer` can have, and its
+   * behaviour and its `{ player, reason }` payload are unchanged. Games that
+   * implement `forfeitPlayer` reach eliminate() instead; see below.
+   */
   private forfeit(nowMs: number, player: PlayerId, reason: 'three_strikes' | 'time' = 'three_strikes'): void {
     if (this.snap.status !== 'running') return;
     this.appendLog(nowMs, 'forfeit', { player, reason }, null);
     this.emit(nowMs, 'forfeit', { player, reason });
     const winners = this.snap.seats.map((s) => s.player).filter((p) => p !== player);
     this.endGame(nowMs, { winners, draw: false, reason: 'forfeit' });
+  }
+
+  /**
+   * NON-TERMINAL elimination — the seat leaves, the table plays on.
+   *
+   * Returns TRUE when the game module converted the loss into an in-game
+   * elimination (game.forfeitPlayer returned a state): the caller must carry
+   * on with the remaining seats. Returns FALSE when there is no such hook, or
+   * the hook declined — forfeit() has then already ended the game and every
+   * caller must return exactly as it did before this path existed.
+   *
+   * The logged entry is a FULL state entry ({ turn_index, player, reason,
+   * state_hash, draws, events? }), unlike the terminal forfeit's
+   * { player, reason }. kernel/verify.ts distinguishes the two on the presence
+   * of `state_hash` and recomputes the elimination by calling the same pure
+   * forfeitPlayer, so a replay containing one still verifies. The entry is
+   * unsigned: 'forfeit' is not in the verifier's SIGNED_KINDS.
+   *
+   * `forfeitPlayer` takes no SeedStream, so the recorded draw delta is always
+   * empty; it is recorded anyway so the entry has the same shape as a move and
+   * a future hook that did draw would be covered without a format change.
+   */
+  private eliminate(nowMs: number, player: PlayerId, reason: 'three_strikes' | 'time'): boolean {
+    if (this.snap.status !== 'running') return false;
+    const drawStart = this.seed.draws().length;
+    const out = this.game.forfeitPlayer?.(this.snap.state, player) ?? null;
+    if (out === null) {
+      this.forfeit(nowMs, player, reason);
+      return false;
+    }
+
+    const turn = this.snap.turnIndex;
+    this.snap.state = out.state;
+    const payload: Record<string, Json> = {
+      turn_index: turn,
+      player,
+      reason,
+      state_hash: hashState(out.state),
+      draws: this.drawsDelta(drawStart),
+    };
+    if (out.events.length > 0) payload['events'] = out.events as unknown as Json;
+    this.appendLog(nowMs, 'forfeit', payload, null);
+
+    // Anything the seat was holding for the current simultaneous phase dies
+    // with it: a seat that is no longer to move must never be replayed.
+    delete this.snap.pendingSimultaneous[player];
+
+    this.refreshPrivateViews();
+    this.emit(nowMs, 'forfeit', { player, reason });
+    this.emitGameEvents(nowMs, turn, player, out.events);
+    return true;
   }
 
   // ------------------------------------------------- simultaneous phases --
@@ -1036,8 +1219,13 @@ export class RoomCore {
       this.recordStrike(nowMs, player, 'illegal_move', this.snap.turnIndex);
       held = { submission, signature: signatureHex, move: null, forced: 'illegal', receivedAtMs: nowMs };
       if ((this.snap.strikes[player] ?? 0) >= 3) {
-        this.forfeit(nowMs, player);
-        return this.okResult(evStart, true);
+        // On the terminal path this returns and the game is over. On the
+        // elimination path collection CONTINUES below: the held marker is
+        // still stored (so waitingFor() can never re-list the seat, and
+        // resolveSimultaneous' playersToMove guard skips it), and the phase
+        // resolves as soon as the surviving movers are all in — otherwise it
+        // would hang until the deadline for a seat that no longer exists.
+        if (!this.eliminate(nowMs, player, 'three_strikes')) return this.okResult(evStart, true);
       }
     } else {
       held = { submission, signature: signatureHex, move: resolved.move, forced: null, receivedAtMs: nowMs };
@@ -1089,8 +1277,15 @@ export class RoomCore {
         // strikes forfeit) — no move is drawn or applied.
         if ((this.snap.strikes[player] ?? 0) >= 2) {
           this.recordStrike(nowMs, player, 'timeout', turn);
-          this.forfeit(nowMs, player);
-          return;
+          // CONTINUE, never return, when the seat is merely eliminated: the
+          // held map was popped into `held` at the top of this method, so a
+          // return here would silently discard every remaining seat's
+          // submission — no log entry, no history row, no event, no rejection,
+          // even though those agents already got { ok:true, applied:false } —
+          // and would then leave waitingFor() re-listing them for the alarm to
+          // force and strike. One flaky agent must never cascade onto the rest.
+          if (!this.eliminate(nowMs, player, 'three_strikes')) return;
+          continue;
         }
         const legal = this.game.legalMoves(this.snap.state, player);
         if (legal.length === 0) throw new Error(`resolveSimultaneous: ${player} to move with no legal moves`);
@@ -1114,8 +1309,8 @@ export class RoomCore {
         // is the third, in which case the forfeit beats the substitution.
         if ((this.snap.strikes[player] ?? 0) >= 2) {
           this.recordStrike(nowMs, player, 'illegal_move', turn);
-          this.forfeit(nowMs, player);
-          return;
+          if (!this.eliminate(nowMs, player, 'three_strikes')) return;
+          continue;
         }
         move = this.drawForcedLegal(player, turn);
         strikeReason = 'illegal_move';
@@ -1124,6 +1319,8 @@ export class RoomCore {
       }
 
       const notation = this.game.moveToNotation(move, this.snap.state);
+      // PRE-move state, as in commitApplied: the phase this seat spoke in.
+      const commentaryPublic = this.commentaryIsPublicIn(this.snap.state, player);
       this.snap.state = applied.state;
       const gameEvents = applied.events;
       const stateHash = hashState(this.snap.state);
@@ -1157,7 +1354,13 @@ export class RoomCore {
       }
 
       const hist: HistoryEntry = { turnIndex: turn, player, notation };
-      if (h.forced === null && strikeReason === null && typeof h.submission?.commentary === 'string' && h.submission.commentary.length > 0) {
+      if (
+        h.forced === null &&
+        strikeReason === null &&
+        commentaryPublic &&
+        typeof h.submission?.commentary === 'string' &&
+        h.submission.commentary.length > 0
+      ) {
         hist.commentary = h.submission.commentary;
       }
       this.snap.history.push(hist);
@@ -1168,10 +1371,10 @@ export class RoomCore {
         player,
         agent_id: seat.agent_id,
         notation,
-        state_hash: stateHash,
         public: this.game.publicView(this.snap.state),
         board_text: this.game.renderText(this.snap.state, null),
       };
+      if (this.publishesStateHash()) evData['state_hash'] = stateHash;
       if (hist.commentary !== undefined) evData['commentary'] = hist.commentary;
       if (h.forced !== null) evData['forced'] = h.forced;
       this.emit(nowMs, entryKind === 'timeout' ? 'timeout' : 'move', evData);
@@ -1180,8 +1383,7 @@ export class RoomCore {
       if (strikeReason !== null) {
         this.recordStrike(nowMs, player, strikeReason, turn);
         if ((this.snap.strikes[player] ?? 0) >= 3) {
-          this.forfeit(nowMs, player);
-          return;
+          if (!this.eliminate(nowMs, player, 'three_strikes')) return;
         }
       }
     }
@@ -1221,16 +1423,20 @@ export class RoomCore {
         this.snap.clocks.cumulativeMs[p] = (this.snap.clocks.cumulativeMs[p] ?? 0) + this.budgetMs();
       }
       // A fallen flag (cumulative side clock exhausted) beats resolution: the
-      // first absentee in seat order past their budget loses on time.
+      // first absentee in seat order past their budget loses on time. When the
+      // game eliminates instead of forfeiting, every fallen flag in the phase
+      // is taken in seat order and the phase then resolves normally for the
+      // seats that are still in it.
       for (const s of this.snap.seats) {
         if (this.snap.pendingSimultaneous[s.player]?.forced === 'timeout' && this.flagFallen(s.player)) {
-          this.forfeit(nowMs, s.player, 'time');
-          return {
-            fired: true,
-            ended: this.isEnded(),
-            deadline_at_ms: this.snap.deadlineAtMs,
-            events: this.snap.events.slice(evStart),
-          };
+          if (!this.eliminate(nowMs, s.player, 'time')) {
+            return {
+              fired: true,
+              ended: this.isEnded(),
+              deadline_at_ms: this.snap.deadlineAtMs,
+              events: this.snap.events.slice(evStart),
+            };
+          }
         }
       }
       this.resolveSimultaneous(nowMs);
@@ -1258,7 +1464,10 @@ export class RoomCore {
     // never win by their own forced game-ending move.
     if ((this.snap.strikes[player] ?? 0) >= 2) {
       this.recordStrike(nowMs, player, 'timeout', turn);
-      this.forfeit(nowMs, player);
+      // Elimination keeps the game running, so the turn must advance: nothing
+      // was applied at it, and the seats that inherit the phase need a fresh
+      // deadline and a fresh illegal-attempt count.
+      if (this.eliminate(nowMs, player, 'three_strikes')) this.advanceTurn(nowMs, turn);
       return {
         fired: true,
         ended: this.isEnded(),
@@ -1270,7 +1479,7 @@ export class RoomCore {
     // Cumulative side clock exhausted (spec games.chess.clock): flag fall —
     // the stalling player loses on time.
     if (this.flagFallen(player)) {
-      this.forfeit(nowMs, player, 'time');
+      if (this.eliminate(nowMs, player, 'time')) this.advanceTurn(nowMs, turn);
       return {
         fired: true,
         ended: this.isEnded(),
@@ -1309,15 +1518,16 @@ export class RoomCore {
 
     this.snap.history.push({ turnIndex: turn, player, notation });
     this.refreshPrivateViews();
-    this.emit(nowMs, 'timeout', {
+    const timeoutEv: Record<string, Json> = {
       turn_index: turn,
       player,
       agent_id: seat.agent_id,
       notation,
-      state_hash: stateHash,
       public: this.game.publicView(this.snap.state),
       board_text: this.game.renderText(this.snap.state, null),
-    });
+    };
+    if (this.publishesStateHash()) timeoutEv['state_hash'] = stateHash;
+    this.emit(nowMs, 'timeout', timeoutEv);
     this.emitGameEvents(nowMs, turn, player, gameEvents);
     this.recordStrike(nowMs, player, 'timeout', turn);
 
@@ -1339,8 +1549,33 @@ export class RoomCore {
 
   // ------------------------------------------------------------------ end --
 
-  private endGame(nowMs: number, result: GameResult): void {
+  private endGame(nowMs: number, incoming: GameResult): void {
     if (this.snap.status !== 'running') return;
+
+    // Which side each seat was on, for the team-aware rating decomposition
+    // (src/match/ratings.ts#decomposeGame). The finalize path never sees the
+    // state, so this is the one place it can be stamped, and every ending
+    // funnels through here.
+    //
+    // ONLY on a non-terminal final state. When the state IS terminal the
+    // result came out of the game module, and verify.ts's 'result' check
+    // deep-compares the logged result against isTerminal on the recomputed
+    // final state — so adding a key there would fail every replay. A game
+    // that wants teams on its own endings returns them from isTerminal
+    // (werewolf does); a game with teamsOf but a teams-less isTerminal must
+    // keep the result the module produced, byte for byte.
+    //
+    // What is left is the room-SYNTHESIZED endings — forfeit, resignation,
+    // agreement — where the result never passed through the game module and
+    // the verifier checks the winners against the cause entry instead. Those
+    // are exactly the endings the rating layer would otherwise have to score
+    // as a free-for-all, rating a werewolf against its own packmate.
+    // Games without the hook are untouched: `teams` stays absent and ratings
+    // take the byte-identical pairwise path.
+    const teams =
+      incoming.teams ?? (this.game.isTerminal(this.snap.state) ? undefined : this.game.teamsOf?.(this.snap.state));
+    const result: GameResult = teams === undefined ? incoming : { ...incoming, teams };
+
     this.snap.status = 'ended';
     this.snap.result = result;
     this.snap.deadlineAtMs = null;
@@ -1349,11 +1584,24 @@ export class RoomCore {
 
     const finalStateHash = hashState(this.snap.state);
     this.appendLog(nowMs, 'end', { result: result as unknown as Json, final_state_hash: finalStateHash }, null);
-    this.appendLog(nowMs, 'reveal', {
+
+    // Hidden-information games publish whatever they kept secret (a role map)
+    // through revealOnEnd, merged into the EXISTING reveal entry and event —
+    // which the room already emits strictly AFTER `end`. A separate event
+    // emitted from apply() would fire while the room is still running and
+    // trip every "no secret in a pre-end event" gate. The three commit-reveal
+    // fields the verifier checks are written last so a game module can never
+    // shadow them.
+    const extra = this.game.revealOnEnd?.(this.snap.state);
+    const disclosure: Record<string, Json> =
+      typeof extra === 'object' && extra !== null && !Array.isArray(extra) ? { ...extra } : {};
+    const revealPayload: Record<string, Json> = {
+      ...disclosure,
       reveal_secret: this.snap.secret,
       final_seed: this.snap.final_seed,
       drand_randomness: this.snap.drand_randomness,
-    }, null);
+    };
+    this.appendLog(nowMs, 'reveal', revealPayload, null);
 
     // The replay file is assembled on demand by replayFile() — never stored
     // in the snapshot (it duplicates the whole log and would overflow the
@@ -1363,6 +1611,7 @@ export class RoomCore {
     // (spec §identity_and_integrity.spectator_reveal).
     this.emit(nowMs, 'end', { result: result as unknown as Json, final_state_hash: finalStateHash });
     this.emit(nowMs, 'reveal', {
+      ...disclosure,
       commitment: this.snap.commitment,
       reveal_secret: this.snap.secret,
       final_seed: this.snap.final_seed,

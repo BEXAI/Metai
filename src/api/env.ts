@@ -57,6 +57,11 @@ export interface RoomNamespace {
  */
 export interface Secrets {
   checkpoint_sk?: string;
+  /**
+   * Seed the house-agent keys are derived from (src/api/house.ts). Absent ->
+   * house backfill is OFF everywhere; it never falls back to a default key.
+   */
+  house_sk_seed?: string;
 }
 
 export interface ApiEnv {

@@ -36,6 +36,14 @@ export interface WorkerEnv {
   ASSETS?: Fetcher;
   /** Worker secret (never in the repo): Ed25519 hex secret for checkpoints + doorbell rings. */
   CHECKPOINT_SK?: string;
+  /**
+   * Worker secret (never in the repo): the seed every house-agent key is
+   * derived from (src/api/house.ts). Absent -> no house backfill and no house
+   * driving, which is the state of production until the roster is seeded.
+   * The SAME value must be given to scripts/seed-house-agents.ts or the
+   * derived keys will not match the registered pubkeys.
+   */
+  HOUSE_SK_SEED?: string;
   /** Test-only: per-move clock override (ms) for pairer-created games. Never set in production. */
   PER_MOVE_MS_OVERRIDE?: string;
 }
@@ -47,6 +55,7 @@ export interface WorkerEnv {
 export function toApiEnv(env: WorkerEnv): ApiEnv {
   const secrets: ApiEnv['secrets'] = {};
   if (env.CHECKPOINT_SK) secrets.checkpoint_sk = env.CHECKPOINT_SK;
+  if (env.HOUSE_SK_SEED) secrets.house_sk_seed = env.HOUSE_SK_SEED;
   const apiEnv: ApiEnv = {
     DB: env.DB as unknown as Db,
     CACHE: env.CACHE as unknown as Kv,

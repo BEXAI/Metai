@@ -1,17 +1,18 @@
 /**
  * In-memory fakes for the narrow ApiEnv (src/api/env.ts).
  *
- * The D1 fake wraps node:sqlite and loads the REAL schema.sql, so every unit
- * test also exercises the schema (PKs, unique indexes, ON CONFLICT clauses)
- * exactly as D1 (SQLite) will. KV honors TTLs against the injectable test
+ * The D1 fake wraps node:sqlite and loads the REAL schema — schema.sql plus
+ * every migrations/*.sql in order (migrations/apply.ts) — so every unit test
+ * also exercises the schema (PKs, unique indexes, ON CONFLICT clauses)
+ * exactly as D1 (SQLite) will, and no migration can ship to production
+ * without a test seeing it. KV honors TTLs against the injectable test
  * clock. The room namespace fake lets tests script the Durable Object's
  * responses and records every forwarded request.
  */
 
-import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { fileURLToPath } from 'node:url';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
+import { applySchema } from '../../../migrations/apply.ts';
 
 // Vite (vitest's transformer) predates the node:sqlite builtin and tries to
 // bundle it; createRequire loads it at runtime, outside the transform.
@@ -37,14 +38,14 @@ export function makeClock(startMs = Date.parse('2026-09-01T12:00:00Z')): TestClo
 
 // --------------------------------------------------------------------- D1 --
 
-const SCHEMA_PATH = fileURLToPath(new URL('../../../schema.sql', import.meta.url).href);
-
 export class FakeDb implements Db {
   readonly db: DatabaseSyncType;
+  /** Schema files applied, in order ('schema.sql', 'migrations/0002_...'). */
+  readonly schemaApplied: string[];
 
   constructor() {
     this.db = new DatabaseSync(':memory:');
-    this.db.exec(readFileSync(SCHEMA_PATH, 'utf8'));
+    this.schemaApplied = applySchema((sql) => this.db.exec(sql));
   }
 
   prepare(query: string): DbStatement {

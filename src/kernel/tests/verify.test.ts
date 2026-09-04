@@ -143,6 +143,106 @@ describe('verifyReplay on the fixture replay', () => {
   });
 });
 
+describe('verifyReplay: the events check and the two forfeit shapes', () => {
+  it('rejects a DELETED events array — the case `?? []` catches and `!== undefined` would not', () => {
+    // Rooms write payload.events only when apply() emitted something, so a
+    // guard on `p.events !== undefined` would let the deletion pass vacuously.
+    const r = clone(buildFixtureReplay());
+    const move = r.log.find((e) => e.kind === 'move')!;
+    expect((move.payload as Record<string, Json>).events).toBeDefined();
+    delete (move.payload as Record<string, Json>).events;
+    rehashLog(r);
+    const report = verifyReplay(r, games);
+    expect(report.ok).toBe(false);
+    const rec = report.checks.find((c) => c.name === 'recomputation')!;
+    expect(rec.ok).toBe(false);
+    expect(rec.detail).toContain('logged events differ from the recomputed apply() events');
+  });
+
+  it('rejects an edited event payload even when every state hash still matches', () => {
+    const r = clone(buildFixtureReplay());
+    const move = r.log.find((e) => e.kind === 'move')!;
+    const events = (move.payload as Record<string, Json>).events as { data: { roll: number } }[];
+    events[0]!.data.roll = 6;
+    rehashLog(r);
+    const report = verifyReplay(r, games);
+    const rec = report.checks.find((c) => c.name === 'recomputation')!;
+    expect(rec.ok).toBe(false);
+    expect(rec.detail).toContain('logged events differ');
+    // Everything the edit did NOT touch still passes.
+    expect(report.checks.find((c) => c.name === 'hash_chain')!.ok).toBe(true);
+    expect(report.checks.find((c) => c.name === 'signatures')!.ok).toBe(true);
+  });
+
+  it('a LEGACY terminal forfeit ({player, reason}, no state_hash) still verifies', () => {
+    // Every game without game.forfeitPlayer logs this shape and nothing
+    // follows it, so the recomputed state must not be advanced — and the
+    // branch must run BEFORE the generic payload.turn_index extraction, which
+    // this payload deliberately lacks.
+    const r = clone(buildFixtureReplay());
+    const endIdx = r.log.findIndex((e) => e.kind === 'end');
+    r.log.splice(endIdx, 0, {
+      seq: 0,
+      kind: 'forfeit',
+      payload: { player: 'p0', reason: 'three_strikes' },
+      prev_hash: '',
+      hash: '',
+      signature: null,
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+    r.log.forEach((e, i) => {
+      e.seq = i;
+    });
+    rehashLog(r);
+    expect(verifyReplay(r, games).checks.filter((c) => !c.ok)).toEqual([]);
+  });
+
+  it('a forfeit carrying a state_hash on a game with no forfeitPlayer is named, not silently skipped', () => {
+    const r = clone(buildFixtureReplay());
+    const endIdx = r.log.findIndex((e) => e.kind === 'end');
+    r.log.splice(endIdx, 0, {
+      seq: 0,
+      kind: 'forfeit',
+      payload: { turn_index: 2, player: 'p0', reason: 'three_strikes', state_hash: '0'.repeat(64), draws: [] },
+      prev_hash: '',
+      hash: '',
+      signature: null,
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+    r.log.forEach((e, i) => {
+      e.seq = i;
+    });
+    rehashLog(r);
+    const rec = verifyReplay(r, games).checks.find((c) => c.name === 'recomputation')!;
+    expect(rec.ok).toBe(false);
+    expect(rec.detail).toContain('the game module has no forfeitPlayer');
+  });
+
+  it('pins the one message the shared resolver changed: a non-integer submission index', () => {
+    // kernel/move.ts adopts rooms/core.ts's stricter
+    // `Number.isInteger(index) && index >= 0`, so a fractional index now
+    // reports as a bad SHAPE rather than falling through to an out-of-range
+    // lookup. Unreachable except by tampering, but it is a decision, not drift.
+    const r = clone(buildFixtureReplay());
+    const move = r.log.filter((e) => e.kind === 'move')[1]!;
+    const payload = move.payload as { player: string; turn_index: number; submission: Record<string, Json> };
+    payload.submission.move = { index: 1.5 };
+    // Re-sign so ONLY the recomputation check speaks.
+    move.signature = signMoveMessage(
+      fixtureKeypair(payload.player),
+      r.game_id,
+      payload.turn_index,
+      payload.submission as Json,
+    );
+    rehashLog(r);
+    const report = verifyReplay(r, games);
+    const rec = report.checks.find((c) => c.name === 'recomputation')!;
+    expect(rec.ok).toBe(false);
+    expect(rec.detail).toContain('submission.move is neither a notation string nor { index }');
+    expect(report.checks.find((c) => c.name === 'signatures')!.ok).toBe(true);
+  });
+});
+
 describe('test/verify-replay.ts CLI', () => {
   const cliPath = fileURLToPath(new URL('../../../test/verify-replay.ts', import.meta.url).toString());
 

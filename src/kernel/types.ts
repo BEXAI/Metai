@@ -22,7 +22,7 @@
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
-/** Seat-ordered player ids: 'p0' .. 'p5'. Seat index === numeric suffix. */
+/** Seat-ordered player ids: 'p0' .. 'pN'. Seat index === numeric suffix. */
 export type PlayerId = string;
 
 export function seatIndex(p: PlayerId): number {
@@ -90,6 +90,19 @@ export interface GameMeta {
   boardText: string;
   /** Smoke-test-only games (tictactoe) are not listed in lobbies. */
   listed: boolean;
+
+  /**
+   * Max characters of in-game speech accepted in MoveSubmission.utterance.
+   * ABSENT (every board game) means the game has NO speech channel: rooms
+   * reject a submitted utterance outright and buildView ships no `speech`.
+   */
+  speechLimit?: number;
+  /** History rows buildView ships to a seated player. Default 20. */
+  historyWindow?: number;
+  /** Default true. False makes rooms reject `resign` submissions. */
+  allowsResign?: boolean;
+  /** Default true. False makes rooms reject `draw_offer` and draw accepts. */
+  allowsDrawOffer?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -103,6 +116,8 @@ export interface GameResult {
   scores?: Record<PlayerId, number>;
   /** 'checkmate', 'resignation', 'timeout', 'turn_limit', 'points', ... */
   reason: string;
+  /** Team id per seat ('wolves', 'village') for team-aggregate ratings. */
+  teams?: Record<PlayerId, string>;
 }
 
 export interface GameEvent {
@@ -110,10 +125,18 @@ export interface GameEvent {
   data: Json;
   /**
    * 'public'  -> spectator feed + log.
-   * 'private' -> log only (revealed in the replay after the game ends);
-   *              `to` limits which players' private views may include it live.
+   * 'private' -> log only (revealed in the replay after the game ends).
    */
   visibility: 'public' | 'private';
+  /**
+   * The audience a private event was addressed to: the documented contract and
+   * the replay reader's audience field. It ENFORCES NOTHING. Nothing in
+   * src/rooms/ or src/kernel/ reads it — `privateView` is a pure function of
+   * (state, player) and never receives events, and emitGameEvents drops every
+   * non-public event before the spectator feed. Live privacy is `visibility`
+   * plus correct view functions, full stop. Set it correctly; never build a
+   * feature that depends on it.
+   */
   to?: PlayerId[];
 }
 
@@ -217,6 +240,46 @@ export interface Game<S extends Json = Json, M extends Json = Json> {
    * (Red-team finding F1: state_string leaked all hidden state live.)
    */
   viewStateString?(state: S, viewer: PlayerId): string;
+
+  // -------------------------------------------------------------------------
+  // Optional surface for speech games and games with non-terminal elimination.
+  // Every hook below is absent in every board game, and the kernel, rooms and
+  // verifier all branch on its presence — so a game that omits them behaves
+  // exactly as it did before these hooks existed.
+  // -------------------------------------------------------------------------
+
+  /**
+   * TOTAL and PURE. No clock, no randomness, no Intl, no String.normalize.
+   * Binds a signed utterance into the resolved move. Called from exactly one
+   * shared helper (kernel/move.ts#resolveSubmittedMove) consumed by
+   * rooms/core.ts#resolveMove and kernel/verify.ts#resolveMove. NEVER on the
+   * forced or timeout paths, so the engine can never attribute fabricated
+   * words to an agent.
+   */
+  bindUtterance?(move: M, utterance: string, state: S, player: PlayerId): M;
+
+  /**
+   * Converts a three-strikes / flag-fall into an in-game elimination.
+   * Returning null (every existing game) keeps today's "all other seats win"
+   * terminal forfeit. Must be PURE: it takes no SeedStream, so the verifier
+   * recomputes it exactly.
+   */
+  forfeitPlayer?(state: S, player: PlayerId): ApplyOk<S> | null;
+
+  /** Per-phase move budget in ms, or null to use the room's per-move clock. */
+  phaseBudgetMs?(state: S): number | null;
+
+  /** Per-phase speech channel descriptor for the view. */
+  speechInfo?(state: S, player: PlayerId): SpeechChannel;
+
+  /** Agent-authored text addressed privately to `viewer`. Untrusted data. */
+  privateMessages?(state: S, viewer: PlayerId): PrivateMessage[];
+
+  /** Team map for the rating layer; stamped onto GameResult by endGame. */
+  teamsOf?(state: S): Record<PlayerId, string>;
+
+  /** Merged into the room's post-`end` `reveal` event and log payload. */
+  revealOnEnd?(state: S): Json;
 }
 
 /** Type-erased game for the registry, rooms, and API. */
@@ -245,6 +308,30 @@ export interface HistoryEntry {
   commentary?: string;
 }
 
+/**
+ * Agent-authored text addressed privately to one viewer (a werewolf pack
+ * whisper). Same trust class as history — see ViewObject.private_messages.
+ * `turn` is game-scoped (werewolf ships the day number): the game module is
+ * pure and cannot see the room's turn counter.
+ */
+export interface PrivateMessage {
+  turn: number;
+  from: PlayerId;
+  channel: string;
+  text: string;
+}
+
+/** What the speech channel accepts for this viewer, in this phase, right now. */
+export interface SpeechChannel {
+  /** Chars accepted RIGHT NOW (per phase). */
+  limit: number;
+  /** meta.speechLimit — stable across phases. */
+  maxLimit: number;
+  audience: 'village' | 'pack' | 'self';
+  /** One engine-authored line describing who reads this text and when. */
+  note: string;
+}
+
 export interface ViewObject {
   game_id: string;
   you: { player: PlayerId; seat: number };
@@ -267,6 +354,14 @@ export interface ViewObject {
   history: HistoryEntry[];
   rules_card: string;
   boundary: typeof CONTENT_BOUNDARY;
+  /** Present only for games with a speech channel (meta.speechLimit). */
+  speech?: SpeechChannel;
+  /**
+   * Agent-authored text addressed privately to THIS viewer. Same trust class
+   * as history: MUST be rendered inside the untrusted fence, and MUST NOT be
+   * restated in privateView, board_text or state_string (all outside it).
+   */
+  private_messages?: PrivateMessage[];
 }
 
 export interface MoveSubmission {
@@ -276,6 +371,13 @@ export interface MoveSubmission {
   move: string | { index: number };
   /** Max 280 chars; public after the move is applied; escaped everywhere. */
   commentary?: string;
+  /**
+   * In-game speech, max meta.speechLimit chars. Unlike commentary this is part
+   * of the MOVE: game.bindUtterance folds it into the move object, so it is
+   * phase-gated by apply(), covered by the state hash, and recomputed by the
+   * offline verifier. Rejected outright by games with no speech channel.
+   */
+  utterance?: string;
   resign?: boolean;
   draw_offer?: boolean;
 }

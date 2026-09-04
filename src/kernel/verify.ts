@@ -21,7 +21,10 @@
  *   game_module      — replay.game resolves in the provided registry.
  *   recomputation    — initialState + every move/timeout re-applied through
  *                      game.apply with a fresh SeedStream over final_seed;
- *                      state hashes, notations, and per-entry draws all match.
+ *                      state hashes, notations, per-entry draws and per-entry
+ *                      events all match. A 'forfeit' entry carrying a
+ *                      state_hash is a non-terminal ELIMINATION and is
+ *                      recomputed through game.forfeitPlayer.
  *   result           — end payload matches replay.result; replay.result matches
  *                      game.isTerminal on the recomputed final state, or is
  *                      explained by a logged resign/forfeit/adjudication/draw_accept.
@@ -52,12 +55,22 @@
  *     `timeout:turn:N`; a logged payload.purpose must equal it).
  *     game.defaultMove is used when the game defines it; otherwise the move
  *     is legal[seed.int('timeout:turn:N', legal.length)].
+ *   - 'forfeit' has two shapes. { player, reason } is the TERMINAL forfeit
+ *     every game without game.forfeitPlayer produces: nothing follows it, so
+ *     the state is not advanced. { turn_index, player, reason, state_hash,
+ *     draws, events? } is a non-terminal ELIMINATION: the state IS advanced,
+ *     by calling the pure game.forfeitPlayer, and everything after it depends
+ *     on the result. Neither shape is signed.
+ *   - payload.events (when present) must equal the events the recomputed
+ *     apply() / forfeitPlayer() emitted, including the private ones that live
+ *     only in the log.
  *   - entry.created_at is not verifiable offline and is ignored.
  */
 
 import { canonicalJson, sha256Hex } from '../crypto/canonical.ts';
 import { verifyEd25519 } from '../crypto/ed25519.ts';
 import { hashState } from './hash.ts';
+import { resolveSubmittedMove } from './move.ts';
 import { createSeedStream } from './seed.ts';
 import {
   COMMIT_PREFIX,
@@ -69,7 +82,6 @@ import {
   type VerifyReport,
 } from './replay.ts';
 import {
-  isParseError,
   isRuleError,
   playerId,
   type AnyGame,
@@ -80,7 +92,14 @@ import {
 type Check = { name: string; ok: boolean; detail?: string };
 type JsonObj = { [key: string]: Json };
 
-const STATE_KINDS: ReadonlySet<string> = new Set(['move', 'timeout']);
+/**
+ * Entry kinds that advance the recomputed state. 'forfeit' is here because a
+ * game with `forfeitPlayer` turns a three-strikes/flag-fall loss into an
+ * in-game ELIMINATION and keeps playing, so that entry mutates state and every
+ * later state_hash depends on it. The terminal forfeit every other game
+ * produces carries no `state_hash` and is skipped, exactly as before.
+ */
+const STATE_KINDS: ReadonlySet<string> = new Set(['move', 'timeout', 'forfeit']);
 const SIGNED_KINDS: ReadonlySet<string> = new Set(['move', 'resign', 'draw_offer', 'draw_accept']);
 const CAUSE_KINDS: ReadonlySet<string> = new Set(['resign', 'forfeit', 'adjudication', 'draw_accept']);
 
@@ -92,6 +111,18 @@ function jsonEq(a: Json, b: Json): boolean {
   return canonicalJson(a) === canonicalJson(b);
 }
 
+/**
+ * Re-resolves a logged submission. The ladder ('#n' / parseMove / { index })
+ * plus the optional bindUtterance step lives in kernel/move.ts, shared verbatim
+ * with rooms/core.ts — a drift between the live room and this verifier would
+ * look exactly like tampering months later. The failure is discriminated there
+ * and worded HERE, so this file's messages are unchanged.
+ *
+ * ONE MESSAGE CHANGED, deliberately (see kernel/move.ts): the shared helper
+ * adopts the room's stricter `Number.isInteger(index) && index >= 0`, so a
+ * non-integer or negative logged index — reachable only by tampering — now
+ * reports as the bad-shape string instead of the out-of-range one.
+ */
 function resolveMove(
   game: AnyGame,
   state: Json,
@@ -99,44 +130,23 @@ function resolveMove(
   payload: JsonObj,
   sub: JsonObj,
 ): { ok: true; move: Json } | { ok: false; detail: string } {
-  const raw = sub.move;
-  let move: Json;
-  if (typeof raw === 'string') {
-    // Kernel-level index fallback (same frozen rule as rooms/core.ts):
-    // '#7' means legal_moves[7] in the game's canonical legalMoves order.
-    const hashIdx = /^#(\d+)$/.exec(raw.trim());
-    if (hashIdx) {
-      const idx = Number(hashIdx[1]);
-      const legal = game.legalMoves(state, player);
-      const picked = legal[idx];
-      if (picked === undefined) {
-        return { ok: false, detail: `submission index #${idx} out of range (${legal.length} legal moves)` };
-      }
-      move = picked;
-    } else {
-      const parsed = game.parseMove(raw, state, player);
-      if (isParseError(parsed)) {
-        return { ok: false, detail: `submission notation '${raw}' did not parse: ${parsed.message}` };
-      }
-      move = parsed;
+  const r = resolveSubmittedMove(game, state, player, sub as { move: unknown; utterance?: unknown });
+  if (!r.ok) {
+    if (r.reason === 'index_out_of_range') {
+      const shown = r.via === 'hash' ? `#${r.index}` : String(r.index);
+      return { ok: false, detail: `submission index ${shown} out of range (${r.legalCount} legal moves)` };
     }
-  } else {
-    const idxObj = asObj(raw);
-    if (!idxObj || typeof idxObj.index !== 'number') {
-      return { ok: false, detail: 'submission.move is neither a notation string nor { index }' };
+    if (r.reason === 'parse_error') {
+      return { ok: false, detail: `submission notation '${r.notation}' did not parse: ${r.parseMessage}` };
     }
-    const legal = game.legalMoves(state, player);
-    const picked = legal[idxObj.index];
-    if (picked === undefined) {
-      return { ok: false, detail: `submission index ${idxObj.index} out of range (${legal.length} legal moves)` };
-    }
-    move = picked;
+    return { ok: false, detail: 'submission.move is neither a notation string nor { index }' };
   }
-  // The signature covers the submission; a separately logged resolved move must agree.
-  if (payload.move !== undefined && !jsonEq(payload.move, move)) {
+  // The signature covers the submission; a separately logged resolved move must
+  // agree. This check has no room analogue, so it stays at this call site.
+  if (payload.move !== undefined && !jsonEq(payload.move, r.move)) {
     return { ok: false, detail: 'payload.move disagrees with the move resolved from the signed submission' };
   }
-  return { ok: true, move };
+  return { ok: true, move: r.move };
 }
 
 export function verifyReplay(replay: ReplayFile, games: Record<string, AnyGame>): VerifyReport {
@@ -273,6 +283,42 @@ export function verifyReplay(replay: ReplayFile, games: Record<string, AnyGame>)
     }
 
     for (const e of replay.log) {
+      // The forfeit branch comes FIRST, before the generic player/turn_index
+      // extraction below, because a TERMINAL forfeit (every game without
+      // game.forfeitPlayer) logs only { player, reason } — no turn_index — and
+      // must keep verifying byte-identically. It is distinguished from a
+      // non-terminal ELIMINATION purely by the presence of `state_hash`.
+      //
+      // Fail-closed: stripping `state_hash` to skip the recomputation is not an
+      // exploit. The hash chain covers the whole payload, so the hash_chain
+      // check catches the edit first, and even if it did not, the next entry's
+      // state_hash (or end.final_state_hash) would no longer match.
+      if (e.kind === 'forfeit') {
+        const fp = asObj(e.payload);
+        if (!fp) return `entry ${e.seq} (forfeit): payload is not an object`;
+        if (fp.state_hash === undefined) continue; // terminal forfeit: state unchanged
+        const fplayer = typeof fp.player === 'string' ? fp.player : null;
+        if (fplayer === null) return `entry ${e.seq} (forfeit): payload.player missing`;
+        if (!game.forfeitPlayer) {
+          return `entry ${e.seq}: forfeit carries state_hash but the game module has no forfeitPlayer`;
+        }
+        const beforeF = seed.draws().length;
+        // forfeitPlayer is pure and takes no SeedStream, so this recomputation
+        // is exact and its draw delta is always empty.
+        const out = game.forfeitPlayer(state, fplayer);
+        if (out === null) return `entry ${e.seq}: forfeitPlayer returned null for a logged elimination`;
+        state = out.state;
+        if (fp.state_hash !== hashState(state)) {
+          return `entry ${e.seq}: state_hash does not match the recomputed state`;
+        }
+        if (!jsonEq(seed.draws().slice(beforeF) as unknown as Json, (fp.draws ?? []) as Json)) {
+          return `entry ${e.seq}: logged draws differ from the recomputed seed draws`;
+        }
+        if (!jsonEq((fp.events ?? []) as Json, out.events as unknown as Json)) {
+          return `entry ${e.seq}: logged events differ from the recomputed forfeitPlayer() events`;
+        }
+        continue;
+      }
       if (!STATE_KINDS.has(e.kind)) continue;
       const p = asObj(e.payload);
       if (!p) return `entry ${e.seq} (${e.kind}): payload is not an object`;
@@ -322,6 +368,14 @@ export function verifyReplay(replay: ReplayFile, games: Record<string, AnyGame>)
       const applied = game.apply(state, player, move, seed);
       if (isRuleError(applied)) {
         return `entry ${e.seq}: apply rejected the logged move '${notation}' (${applied.code}: ${applied.message})`;
+      }
+      // Structured events are part of the record (a werewolf pack whisper is
+      // ONLY in the log), so recompute them too. `?? []` and not an
+      // `e.payload.events !== undefined` guard: rooms write the field only when
+      // apply() emitted something, so an undefined-guard would let DELETION —
+      // the exact tamper this check exists to catch — pass vacuously.
+      if (!jsonEq((p.events ?? []) as Json, applied.events as unknown as Json)) {
+        return `entry ${e.seq}: logged events differ from the recomputed apply() events`;
       }
       state = applied.state;
       const loggedNotation = e.kind === 'move' ? p.notation : p.applied_notation;
@@ -375,6 +429,11 @@ export function verifyReplay(replay: ReplayFile, games: Record<string, AnyGame>)
         }
         return null;
       case 'forfeit':
+        // Only reachable on the TERMINAL forfeit path — a non-terminal
+        // elimination leaves a state that isTerminal() explains, so `term` is
+        // truthy above and this branch is never consulted. That matters: a
+        // game that eliminates a seat may legitimately award it the win with
+        // its team, which the check below would reject.
         if (typeof p.player === 'string' && winners.includes(p.player)) {
           return `forfeiting player ${p.player} is listed as a winner`;
         }

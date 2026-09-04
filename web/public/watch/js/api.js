@@ -142,6 +142,11 @@ export function getOfficial() {
   return getJson('/api/official');
 }
 
+/** Frame names an older, pre-unnamed-frame room might still send. */
+const KNOWN_SSE_TYPES = [
+  'start', 'move', 'timeout', 'strike', 'resign', 'draw_offer', 'draw_accept', 'forfeit', 'submitted', 'end', 'reveal',
+];
+
 /**
  * Subscribe to a game's public spectator event stream. Prefers SSE
  * (EventSource against /api/games/:id/events) and falls back to polling the
@@ -169,6 +174,19 @@ export function subscribeGameEvents(gameId, sinceSeq, onEvents, onStatus) {
     }
   }
 
+  /**
+   * The ONE delivery path, idempotent by seq. Both the SSE listeners and the
+   * polling fallback go through here, so an event that arrives twice — a
+   * belt-and-braces listener firing alongside 'message', or a poll racing a
+   * frame — is delivered to the page exactly once.
+   */
+  function emit(events) {
+    const fresh = events.filter((e) => e && typeof e.seq === 'number' && e.seq > cursor);
+    if (fresh.length === 0) return;
+    bumpCursor(fresh);
+    onEvents(fresh);
+  }
+
   function schedulePoll(delayMs) {
     if (closed) return;
     pollTimer = setTimeout(poll, delayMs);
@@ -177,11 +195,7 @@ export function subscribeGameEvents(gameId, sinceSeq, onEvents, onStatus) {
   async function poll() {
     if (closed) return;
     try {
-      const events = await getGameEventsSince(gameId, cursor);
-      if (events.length > 0) {
-        bumpCursor(events);
-        onEvents(events);
-      }
+      emit(await getGameEventsSince(gameId, cursor));
       notifyStatus('polling');
     } catch (err) {
       notifyStatus('error', err);
@@ -211,16 +225,25 @@ export function subscribeGameEvents(gameId, sinceSeq, onEvents, onStatus) {
       announcedOpen = true;
       notifyStatus('sse');
     });
-    es.addEventListener('message', (ev) => {
+    const onFrame = (ev) => {
       try {
         const payload = JSON.parse(ev.data);
         const events = (Array.isArray(payload) ? payload : Array.isArray(payload && payload.events) ? payload.events : [payload]).map(normalizeEvent);
-        bumpCursor(events);
-        if (events.length > 0) onEvents(events);
+        emit(events);
       } catch {
         // malformed SSE payload — ignore this message, keep the connection
       }
-    });
+    };
+    es.addEventListener('message', onFrame);
+    // Belt and braces. The room sends UNNAMED frames (src/rooms/room.ts
+    // #sseFrame), which arrive as 'message' — but a room deployed before that
+    // change still names them, and EventSource silently drops a named frame
+    // with no matching listener. Registering the known names as well means an
+    // older room streams instead of falling back to 3-second polling. Frames
+    // are de-duplicated by seq, so a frame that somehow reaches both paths is
+    // delivered once. `game:*` is deliberately absent: it is open-ended and
+    // cannot be enumerated, which is why the frames are unnamed now.
+    for (const type of KNOWN_SSE_TYPES) es.addEventListener(type, onFrame);
     es.addEventListener('error', () => {
       if (es) {
         es.close();

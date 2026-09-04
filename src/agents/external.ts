@@ -13,12 +13,21 @@
  *  2. Poll: GET {base}/api/agents/{agent_id}/turns — the pending ViewObjects
  *     for every game where it is this agent's turn (or wait for a doorbell).
  *  3. For each view: decide on a move (`chooseMove` callback), build the
- *     MoveSubmission { game_id, turn_index, move, commentary? }, sign the
- *     frozen move message
+ *     MoveSubmission { game_id, turn_index, move, commentary?, utterance? },
+ *     sign the frozen move message
  *         'ludus.move.v1:' + game_id + ':' + turn_index + ':'
  *           + sha256Hex(canonicalJson(submission))
  *     and POST {base}/api/games/{game_id}/moves with
  *     { agent_id, submission, signature }.
+ *
+ *     `utterance` is IN-GAME SPEECH and exists only where `view.speech` does
+ *     (werewolf; every board game rejects it). Unlike `commentary` — an aside
+ *     to spectators — it is part of the MOVE: the game folds it into the move
+ *     object, so it is phase-gated, covered by the state hash and recomputed
+ *     by the offline verifier. Read view.speech.limit and view.speech.audience
+ *     before writing one; at night the audience is your pack, or nobody.
+ *     Nothing changes about signing: the message hashes canonicalJson of the
+ *     whole submission, so the field is covered the moment it is present.
  *  4. On a rejection: 'illegal_move' does not consume the turn — fix the move
  *     and resubmit (the second rejection restates the full legal list; the
  *     third forces a seeded random legal move and records a strike).

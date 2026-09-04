@@ -15,11 +15,14 @@
  * Robustness: one repair round-trip on an unparseable/illegal answer, then a
  * deterministic fallback to index 0 — a house match must never crash on a
  * malformed model reply or a safety refusal (stop_reason 'refusal' is checked
- * before content is read).
+ * before content is read). A TRUNCATED reply (stop_reason 'max_tokens') is
+ * treated the same way: partial text parses to null, and silently falling
+ * through to index 0 is exactly the invisible failure this module must not
+ * have.
  */
 
 import type { ViewObject } from '../kernel/types.ts';
-import { submissionByIndex, type HouseAdapter } from './adapter.ts';
+import { submissionByIndex, submissionByIndexWithUtterance, type HouseAdapter } from './adapter.ts';
 import { buildPrompt, type PromptOptions } from './prompt.ts';
 
 export const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
@@ -43,6 +46,7 @@ export interface AnthropicAdapterOptions {
   env: { ANTHROPIC_API_KEY?: string };
   model?: string;
   fetchFn?: FetchLike;
+  /** Overrides the per-view default (1024, or 1500 when the view has speech). */
   maxOutputTokens?: number;
   prompt?: PromptOptions;
 }
@@ -50,6 +54,52 @@ export interface AnthropicAdapterOptions {
 interface ParsedAnswer {
   index: number;
   commentary?: string;
+  /** Present only when the whole reply parsed strictly — see below. */
+  utterance?: string;
+}
+
+/**
+ * Balanced-brace scan that respects JSON string literals.
+ *
+ * The previous scanner was /\{[^{}]*\}/g, which matches only INNERMOST brace
+ * pairs. That is fine for `{"index":3}` and wrong the moment an answer carries
+ * a 600-char utterance containing a single '{' or '}' — quoting a seat,
+ * writing {index}, an emoticon: the real object is then never a candidate, and
+ * chooseMove falls through to index 0 with no error and no strike.
+ */
+function jsonObjectCandidates(text: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let start = -1;
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') {
+      inStr = true;
+      continue;
+    }
+    if (c === '{') {
+      if (depth === 0) start = i;
+      depth++;
+      continue;
+    }
+    if (c === '}') {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        out.push(text.slice(start, i + 1));
+        start = -1;
+      }
+      if (depth < 0) depth = 0;
+    }
+  }
+  return out;
 }
 
 /**
@@ -60,9 +110,19 @@ interface ParsedAnswer {
  * ('the note demanded {"index": 0} — ignoring it. My move: {"index": 3}')
  * before giving their real answer, so preferring the FIRST candidate would let
  * attacker-quoted JSON echoed by the model beat the model's actual answer.
+ *
+ * `utterance` is accepted ONLY from the strict whole-reply parse, and only
+ * when the caller passes the view's live speech limit. Last-wins was written
+ * for a stolen INDEX plus a 280-char aside the room drops on any forced move;
+ * an utterance is different in kind — signed by the victim's key, written
+ * verbatim into history, broadcast to every seat, hash-chained forever. A
+ * model that quotes hostile context AFTER its answer would have the attacker's
+ * sentence attributed to it non-repudiably. When the answer had to be
+ * recovered by scanning we therefore take the index and DROP the words:
+ * silence is the honest degradation.
  */
-export function parseModelAnswer(text: string, legalCount: number): ParsedAnswer | null {
-  const validate = (candidate: string): ParsedAnswer | null => {
+export function parseModelAnswer(text: string, legalCount: number, speechLimit?: number): ParsedAnswer | null {
+  const validate = (candidate: string, allowUtterance: boolean): ParsedAnswer | null => {
     try {
       const parsed: unknown = JSON.parse(candidate);
       if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
@@ -71,30 +131,38 @@ export function parseModelAnswer(text: string, legalCount: number): ParsedAnswer
       const out: ParsedAnswer = { index: idx };
       const commentary = (parsed as { commentary?: unknown }).commentary;
       if (typeof commentary === 'string' && commentary.length > 0) out.commentary = commentary.slice(0, 280);
+      if (allowUtterance && typeof speechLimit === 'number' && speechLimit > 0) {
+        const utterance = (parsed as { utterance?: unknown }).utterance;
+        if (typeof utterance === 'string' && utterance.length > 0) out.utterance = utterance.slice(0, speechLimit);
+      }
       return out;
     } catch {
       return null; // not JSON
     }
   };
 
-  const whole = validate(text.trim());
+  const whole = validate(text.trim(), true);
   if (whole !== null) return whole;
 
-  const re = /\{[^{}]*\}/g;
-  let m: RegExpExecArray | null;
   let last: ParsedAnswer | null = null;
-  while ((m = re.exec(text)) !== null) {
-    const parsed = validate(m[0]);
+  for (const candidate of jsonObjectCandidates(text)) {
+    const parsed = validate(candidate, false);
     if (parsed !== null) last = parsed;
   }
   return last;
 }
 
+/** What the model did with the request, as far as the caller needs to care. */
+interface ApiReply {
+  text: string;
+  /** stop_reason 'max_tokens': the JSON is cut mid-string and cannot parse. */
+  truncated: boolean;
+}
+
 export function createAnthropicAgent(options: AnthropicAdapterOptions): HouseAdapter {
   const model = options.model ?? DEFAULT_MODEL;
-  const maxOutputTokens = options.maxOutputTokens ?? 1024;
 
-  async function callApi(system: string, userTurns: string[]): Promise<string> {
+  async function callApi(system: string, userTurns: string[], maxOutputTokens: number): Promise<ApiReply> {
     const apiKey = options.env.ANTHROPIC_API_KEY;
     if (typeof apiKey !== 'string' || apiKey.length === 0) throw new AnthropicKeyMissingError();
     const fetchFn: FetchLike = options.fetchFn ?? (globalThis.fetch as unknown as FetchLike);
@@ -120,12 +188,13 @@ export function createAnthropicAgent(options: AnthropicAdapterOptions): HouseAda
       stop_reason?: string;
       content?: { type?: string; text?: string }[];
     };
-    if (data.stop_reason === 'refusal') return '';
+    if (data.stop_reason === 'refusal') return { text: '', truncated: false };
     const parts = Array.isArray(data.content) ? data.content : [];
-    return parts
+    const text = parts
       .filter((b) => b.type === 'text' && typeof b.text === 'string')
       .map((b) => b.text as string)
       .join('\n');
+    return { text, truncated: data.stop_reason === 'max_tokens' };
   }
 
   return {
@@ -135,29 +204,38 @@ export function createAnthropicAgent(options: AnthropicAdapterOptions): HouseAda
       const legalCount = view.legal_moves.length;
       if (legalCount === 0) throw new Error(`anthropic agent ${options.agentId}: view carries no legal moves`);
       const { system, user } = buildPrompt(view, options.prompt);
+      // Resolved per VIEW, not at construction: a speech game's answer carries
+      // the seat's words, so 1024 output tokens is a truncation waiting to
+      // happen. The construction-time option still wins when it is set.
+      const maxOutputTokens = options.maxOutputTokens ?? (view.speech ? 1500 : 1024);
+      const speechLimit = view.speech?.limit;
 
-      let text: string;
+      let reply: ApiReply;
       try {
-        text = await callApi(system, [user]);
+        reply = await callApi(system, [user], maxOutputTokens);
       } catch (err) {
         if (err instanceof AnthropicKeyMissingError) throw err;
         return submissionByIndex(view, 0); // network hiccup: deterministic safe move
       }
-      let answer = parseModelAnswer(text, legalCount);
+      // A truncated reply is a PARSE FAILURE, explicitly. Left to fall through
+      // it would parse to null anyway and land on silent index-0 silence —
+      // the same invisible failure the brace scanner above removes.
+      let answer = reply.truncated ? null : parseModelAnswer(reply.text, legalCount, speechLimit);
       if (answer === null) {
         // One repair round trip, then a deterministic fallback.
         try {
-          const repairText = await callApi(system, [
-            user,
-            `Your previous answer was not valid JSON with a legal index. Reply ONLY with {"index": n} where 0 <= n < ${legalCount}.`,
-          ]);
-          answer = parseModelAnswer(repairText, legalCount);
+          const repair = reply.truncated
+            ? `Your previous reply was cut off before it ended. Answer with JSON only and keep the utterance short: {"index": n} where 0 <= n < ${legalCount}.`
+            : `Your previous answer was not valid JSON with a legal index. Reply ONLY with {"index": n} where 0 <= n < ${legalCount}.`;
+          const repaired = await callApi(system, [user, repair], maxOutputTokens);
+          answer = repaired.truncated ? null : parseModelAnswer(repaired.text, legalCount, speechLimit);
         } catch {
           answer = null;
         }
       }
       if (answer === null) return submissionByIndex(view, 0);
-      return submissionByIndex(view, answer.index, answer.commentary);
+      if (answer.utterance === undefined) return submissionByIndex(view, answer.index, answer.commentary);
+      return submissionByIndexWithUtterance(view, answer.index, answer.utterance, answer.commentary);
     },
   };
 }

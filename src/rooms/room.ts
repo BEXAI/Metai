@@ -49,6 +49,8 @@ import { generateSecretHex } from '../crypto/commit.ts';
 import { getGame } from '../games/index.ts';
 import type { LogEntry, ReplayFile } from '../kernel/replay.ts';
 import type { AnyGame, HistoryEntry, Json, MoveSubmission, PlayerId, SeedDraw, VariantConfig } from '../kernel/types.ts';
+import { houseKeyringFromSeed, isHouseHandle } from '../api/house.ts';
+import { HouseDriver, isHouseDrivenGame } from './house-driver.ts';
 import {
   PV_RETAIN_TURNS,
   RoomCore,
@@ -100,6 +102,12 @@ export interface RoomEnv {
   REPLAYS?: ReplayBucket;
   /** D1 database. When the binding is absent end-of-game D1 rows are skipped. */
   DB?: RoomDb;
+  /**
+   * The Worker secret the house-agent keys are derived from. The DO receives
+   * the Worker's env, so this is the binding name, not the ApiEnv `secrets`
+   * shape. Absent -> no house seat is ever driven (src/api/house.ts).
+   */
+  HOUSE_SK_SEED?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -140,9 +148,31 @@ const PUT_BATCH = 100;
 const D1_BATCH = 50;
 const FINALIZE_RETRY_MS = 5_000;
 const ALARM_RETRY_MS = 5_000;
+/** SSE reconnect hint, sent once at stream start. */
+const SSE_RETRY_MS = 5_000;
 
 function pad8(n: number): string {
   return String(n).padStart(8, '0');
+}
+
+/**
+ * One SSE frame per spectator event, deliberately UNNAMED — no `event:` line.
+ *
+ * These frames used to carry `event: ${ev.type}`. EventSource routes a NAMED
+ * frame only to a listener registered for that exact name and drops it
+ * silently otherwise, and the /watch client registers just the default
+ * 'message' listener — so the live stream delivered nothing, for every game,
+ * and the pages fell back to 3-second polling without ever reporting an error
+ * (no 'error' fires on a healthy stream). Naming the frames is also
+ * structurally wrong for the open-ended `game:*` namespace, which a client
+ * cannot enumerate ahead of the games that emit it.
+ *
+ * Nothing is lost: the type is inside the JSON payload, which is where every
+ * consumer already reads it from (the polling fallback has no frame name to
+ * read either).
+ */
+function sseFrame(ev: SpectatorEvent): string {
+  return `id: ${ev.seq}\ndata: ${JSON.stringify(ev)}\n\n`;
 }
 
 /** Counts of persisted rows per family — reassembly slices to these. */
@@ -246,10 +276,43 @@ export class GameRoom {
   private persisted: Watermarks = zeroWatermarks();
   private readonly subscribers = new Set<SseSubscriber>();
   private readonly encoder = new TextEncoder();
+  /**
+   * Drives this room's house seats from the room's own alarm (§8.3). Null when
+   * HOUSE_SK_SEED is not configured, which is production today — the driver is
+   * then never constructed, never reads storage, and the ordinary deadline
+   * timeout stays the only mover of a house seat.
+   */
+  private readonly houseDriver: HouseDriver | null;
 
   constructor(ctx: RoomCtx, env: RoomEnv) {
     this.ctx = ctx;
     this.env = env;
+    const keyring = houseKeyringFromSeed(env.HOUSE_SK_SEED);
+    this.houseDriver = keyring === null ? null : new HouseDriver(ctx.storage, { keyring });
+  }
+
+  /**
+   * The driver, but only for a room the driver can actually move: one that
+   * seats a house agent IN A GAME WITH A HOUSE POLICY.
+   *
+   * This guard is why the twelve existing games do no extra work at all: with
+   * no house seat there is no 'housedue' key to read, arm or delete, so their
+   * per-move storage traffic is byte-for-byte what it was. It is an in-memory
+   * check over the seat list, and seats never change after /create.
+   *
+   * The GAME half of the check is load-bearing, not belt-and-braces. The pairer
+   * backfills a short 2-seat chess/go/checkers queue with a general-purpose
+   * `house-*` agent, and defaultAdapterFor has no policy for those games — so a
+   * handle-only guard armed a driver that then stood down on every wake:
+   * drive() wrote null, persist() re-armed HOUSE_MOVE_DELAY_MS out, and the
+   * room woke and wrote twice every 3 s for the entire per-move budget (~20x on
+   * chess, ~100x on the 5-minute default) while nothing progressed. Arming and
+   * driving must agree on which rooms are drivable.
+   */
+  private houseFor(core: RoomCore): HouseDriver | null {
+    if (this.houseDriver === null) return null;
+    if (!isHouseDrivenGame(core.game.meta.id)) return null;
+    return core.seats.some((s) => isHouseHandle(s.handle)) ? this.houseDriver : null;
   }
 
   // ------------------------------------------------------------ lifecycle --
@@ -262,6 +325,9 @@ export class GameRoom {
       this.core = this.hydrate(snap);
       this.persisted = watermarks;
       this.loaded = true;
+      // The house due time lives under its own key so it survives eviction,
+      // which nulls this.core. Read only for a room that seats a house agent.
+      await this.houseFor(this.core)?.load();
       return this.core;
     }
     const legacy = await this.ctx.storage.get<RoomSnapshot>(KEY_LEGACY);
@@ -414,15 +480,42 @@ export class GameRoom {
       sdChunks: counts.sd_chunks,
       pvFloor: counts.pv_floor,
     };
+    // Arm the house driver AFTER the core is durable, and unconditionally:
+    // arm() is idempotent per turn (a simultaneous phase persists once per
+    // submission without moving the turn index, and re-arming with a fresh
+    // delay each time would push the due time out forever) and it disarms
+    // itself when nothing is pending. syncAlarm runs after it, so the alarm
+    // it sets already accounts for the new due time.
+    const house = this.houseFor(core);
+    if (house) {
+      try {
+        await house.arm(core, Date.now());
+      } catch (err) {
+        // A house seat that fails to arm is driven by the ordinary deadline
+        // timeout instead; never fail a real agent's move over it.
+        logStructured('room_house_arm_failure', core.gameId, err);
+      }
+    }
     await this.syncAlarm(core);
     await this.prunePrivateViews(core, oldFloor, pvFloor);
   }
 
-  /** Alarm follows the deadline; losses self-heal (moves/ticks run timeout()). */
+  /**
+   * The next wake: the move deadline, or the house driver's due time, whichever
+   * comes first. Losses self-heal (moves/ticks run timeout()).
+   */
+  private nextAlarmMs(core: RoomCore): number | null {
+    const deadline = core.deadlineAtMs;
+    const house = this.houseFor(core)?.dueAtMs ?? null;
+    if (deadline === null) return house;
+    return house === null ? deadline : Math.min(deadline, house);
+  }
+
   private async syncAlarm(core: RoomCore): Promise<void> {
     try {
       if (core.status === 'running') {
-        if (core.deadlineAtMs !== null) await this.ctx.storage.setAlarm(core.deadlineAtMs);
+        const at = this.nextAlarmMs(core);
+        if (at !== null) await this.ctx.storage.setAlarm(at);
         else await this.ctx.storage.deleteAlarm();
       } else if (core.finalized) {
         await this.ctx.storage.deleteAlarm();
@@ -453,13 +546,29 @@ export class GameRoom {
     }
   }
 
-  /** DO alarm: move deadline passed, or a pending finalize retry. */
+  /** DO alarm: a house seat is due, the move deadline passed, or a finalize retry. */
   async alarm(): Promise<void> {
     let gameId = 'unknown';
     try {
       const core = await this.load();
       if (!core) return;
       gameId = core.gameId;
+
+      // House seats first, and BEFORE the timeout branch. Their due time is
+      // always earlier than the deadline they were armed against, so a wake at
+      // the house due time must not be read as an expired turn: running
+      // timeout() here would strike out the very seats the driver is about to
+      // move. The driver re-arms itself while its queue drains and persist()
+      // sets the next alarm, so returning is the whole loop.
+      const house = this.houseFor(core);
+      if (core.status === 'running' && house !== null && house.dueAtMs !== null && Date.now() >= house.dueAtMs) {
+        const out = await house.run(core, Date.now());
+        await this.persist(core);
+        this.broadcast(out.events);
+        if (core.status !== 'running') await this.finalize(core);
+        return;
+      }
+
       if (core.status === 'running') {
         const result = core.timeout(Date.now());
         await this.persist(core);
@@ -801,9 +910,9 @@ export class GameRoom {
     let sub: SseSubscriber | null = null;
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
-        for (const ev of backlog) {
-          controller.enqueue(encoder.encode(`id: ${ev.seq}\nevent: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`));
-        }
+        // Reconnect hint plus the whole backlog in one chunk: a reader that
+        // takes a single chunk gets the events, not just the directive.
+        controller.enqueue(encoder.encode(`retry: ${SSE_RETRY_MS}\n\n` + backlog.map(sseFrame).join('')));
         sub = { controller, closed: false };
         subscribers.add(sub);
       },
@@ -846,9 +955,7 @@ export class GameRoom {
       if (sub.closed) continue;
       try {
         for (const ev of events) {
-          sub.controller.enqueue(
-            this.encoder.encode(`id: ${ev.seq}\nevent: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`),
-          );
+          sub.controller.enqueue(this.encoder.encode(sseFrame(ev)));
         }
       } catch {
         sub.closed = true;

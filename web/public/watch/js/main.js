@@ -14,9 +14,15 @@ import * as replay from './pages/replay.js';
 import * as agents from './pages/agents.js';
 import * as leaderboards from './pages/leaderboards.js';
 import * as docket from './pages/docket.js';
+import * as werewolf from './pages/werewolf.js';
 
 route('/live', live.mount);
 route('/game/:id', game.mount);
+// Werewolf's spectator artifact is a transcript, not a board, so it gets its
+// own mount. #/game/:id stays the canonical entry and dispatches here when the
+// row's game is 'werewolf' (see notes/WEREWOLF_FULLSTACK_PLAN.md §6.3); this
+// route is what makes the theater directly linkable in the meantime.
+route('/werewolf/:id', werewolf.mount);
 route('/replay/:id', replay.mount);
 route('/agents/:handle', agents.mount);
 route('/leaderboards', leaderboards.mount);

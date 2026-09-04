@@ -16,6 +16,7 @@ import { el, text, clear, inertParagraph } from '../dom.js';
 import { getGame, getGameEventsSince, getReplay, subscribeGameEvents } from '../api.js';
 import { renderBoard } from '../boards/index.js';
 import { pickGameType, pickVariant, pickDivision, displayHandle } from '../shapes.js';
+import * as werewolf from './werewolf.js';
 
 const CLOCK_TICK_MS = 1000;
 
@@ -24,8 +25,45 @@ const BOARD_EVENT_TYPES = new Set(['start', 'move', 'timeout']);
 // Event types worth a line in the move/activity list.
 const LOGGABLE_EVENT_TYPES = new Set(['move', 'timeout', 'strike', 'resign', 'draw_offer', 'draw_accept', 'forfeit', 'end']);
 
+/**
+ * A game module's own public events arrive as `game:<type>`
+ * (src/rooms/core.ts#emitGameEvents). The namespace is open-ended — one entry
+ * per game per event kind — so it is matched by prefix rather than enumerated.
+ * Membership-testing the two fixed sets above used to discard every one of
+ * them before any renderer saw it, which silently dropped landlord's and
+ * islanders' events too.
+ */
+function isLoggable(type) {
+  return LOGGABLE_EVENT_TYPES.has(type) || (typeof type === 'string' && type.startsWith('game:'));
+}
+
+/**
+ * Hidden information is per game, and the old copy named playing cards for all
+ * thirteen. Werewolf reaches the theater rather than this page, but a link to
+ * an ended werewolf game can still land here.
+ */
+const SEALED_COPY = {
+  landlord: 'hands, deck order, unplayed cards',
+  islanders: 'hands, development cards',
+  werewolf: 'roles, night actions, the wolves’ pack channel',
+};
+const SEALED_COPY_DEFAULT = 'every player’s private state';
+
 function describeEvent(ev) {
   const d = ev.data || {};
+  // `game:*` payloads are wrapped one level deeper by emitGameEvents:
+  // { turn_index, player, data } where `data` is the module's own payload.
+  if (typeof ev.type === 'string' && ev.type.startsWith('game:')) {
+    // `d.player` is the seat whose apply() PRODUCED the event, which is not the
+    // actor whenever a phase resolves inside the last mover's apply — werewolf
+    // emits a whole discussion round's `game:speech` events from one seat, so
+    // attributing by `d.player` credits all eight utterances to that seat.
+    // Prefer whatever actor key the module's own payload carries; the werewolf
+    // theater already does this and the two surfaces must not disagree.
+    const inner = d.data && typeof d.data === 'object' ? d.data : {};
+    const actor = inner.speaker ?? inner.seat ?? inner.from ?? inner.who ?? inner.by ?? d.player;
+    return { turn: d.turn_index, player: actor, notation: null, note: ev.type.slice('game:'.length) };
+  }
   switch (ev.type) {
     case 'move':
       return { turn: d.turn_index, player: d.player, notation: d.notation, commentary: d.commentary, note: d.forced ? '(forced: illegal move)' : null };
@@ -102,7 +140,25 @@ function renderClock(container, lastEventAtIso) {
   );
 }
 
-export function mount(container, params) {
+/**
+ * #/game/:id is the canonical entry for "one live game" for every game in the
+ * hall. Werewolf's spectator artifact is a transcript, not a board, so the row
+ * is fetched here once and the werewolf theater is mounted in place of the
+ * classic board page — the row is handed on so the theater does not refetch.
+ * Everything else takes the classic page below, unchanged.
+ */
+export async function mount(container, params, query) {
+  let row = null;
+  try {
+    row = await getGame(params.id);
+  } catch {
+    // Leave row null: the classic page renders the failure with its own banner.
+  }
+  if (row && pickGameType(row) === 'werewolf') return werewolf.mount(container, params, query, row);
+  return mountClassic(container, params, row);
+}
+
+function mountClassic(container, params, preloadedRow) {
   const gameId = params.id;
   clear(container);
   container.appendChild(el('h1', { class: 'page-title' }, `Game ${gameId}`));
@@ -193,7 +249,11 @@ export function mount(container, params) {
       }
     } else {
       sealedArea.appendChild(
-        el('div', { class: 'sealed-marker' }, '\u{1F512} hidden information (hands, deck order, unplayed cards) is sealed until this game ends'),
+        el(
+          'div',
+          { class: 'sealed-marker' },
+          `\u{1F512} hidden information (${SEALED_COPY[type] ?? SEALED_COPY_DEFAULT}) is sealed until this game ends`,
+        ),
       );
     }
   }
@@ -232,13 +292,13 @@ export function mount(container, params) {
         if (ev.data.public !== undefined) latestPublicView = ev.data.public;
         if (typeof ev.data.board_text === 'string') latestBoardText = ev.data.board_text;
       }
-      if (LOGGABLE_EVENT_TYPES.has(ev.type)) logEntries.push(ev);
+      if (isLoggable(ev.type)) logEntries.push(ev);
     }
   }
 
   async function initialLoad() {
     try {
-      row = await getGame(gameId);
+      row = preloadedRow ?? (await getGame(gameId));
       renderSeats(seatsArea, row && row.seats);
     } catch (err) {
       clear(errorArea);

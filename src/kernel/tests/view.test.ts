@@ -82,6 +82,94 @@ describe('buildView', () => {
     expect(view.history[0]!.turnIndex).toBe(5); // oldest 5 dropped
     expect(view.history[19]!.turnIndex).toBe(24);
   });
+
+  it('ships no speech or private_messages key for a game without the hooks', () => {
+    const state = freshState();
+    const player = fixtureGame.playersToMove(state)[0]!;
+    const view = buildView(fixtureGame as AnyGame, state, player, opts());
+    expect('speech' in view).toBe(false);
+    expect('private_messages' in view).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// historyLimit (sourced from meta.historyWindow by rooms) and the optional
+// speech surfaces. All default-off: a game without the hooks is untouched.
+// ---------------------------------------------------------------------------
+
+describe('buildView historyLimit', () => {
+  const history: HistoryEntry[] = Array.from({ length: 25 }, (_, i) => ({
+    turnIndex: i,
+    player: i % 2 === 0 ? 'p0' : 'p1',
+    notation: `take${(i % 3) + 1}`,
+  }));
+
+  function viewWith(historyLimit?: number): HistoryEntry[] {
+    const state = freshState();
+    const player = fixtureGame.playersToMove(state)[0]!;
+    const extra: Partial<BuildViewOptions> = { history };
+    if (historyLimit !== undefined) extra.historyLimit = historyLimit;
+    return buildView(fixtureGame as AnyGame, state, player, opts(extra)).history;
+  }
+
+  it('defaults to 20 — byte-identical to the hard-coded slice it replaced', () => {
+    expect(viewWith()).toEqual(viewWith(20));
+    expect(viewWith()).toHaveLength(20);
+  });
+
+  it('ships the requested window when it is larger than the default', () => {
+    const rows = viewWith(60);
+    expect(rows).toHaveLength(25); // the whole history; 60 > 25
+    expect(rows[0]!.turnIndex).toBe(0);
+  });
+
+  it('ships nothing at 0 — slice(-0) would return the whole array', () => {
+    expect(viewWith(0)).toEqual([]);
+    expect(viewWith(-1)).toEqual([]);
+  });
+});
+
+describe('buildView speech surfaces', () => {
+  const speech = { limit: 300, maxLimit: 600, audience: 'pack' as const, note: 'Your pack reads this.' };
+  const messages = [{ turn: 2, from: 'p1', channel: 'pack', text: 'take the doctor claim tomorrow' }];
+
+  it('attaches speech and private_messages only when the hooks exist', () => {
+    const state = freshState();
+    const player = fixtureGame.playersToMove(state)[0]!;
+    const speaking: AnyGame = {
+      ...(fixtureGame as AnyGame),
+      speechInfo: () => speech,
+      privateMessages: () => messages,
+    };
+    const view = buildView(speaking, state, player, opts());
+    expect(view.speech).toEqual(speech);
+    expect(view.private_messages).toEqual(messages);
+
+    const silent = buildView(fixtureGame as AnyGame, state, player, opts());
+    expect(JSON.stringify(silent)).toBe(
+      JSON.stringify({ ...view, speech: undefined, private_messages: undefined }),
+    );
+  });
+
+  it('passes the viewer through to both hooks', () => {
+    const state = freshState();
+    const player = fixtureGame.playersToMove(state)[0]!;
+    const seen: string[] = [];
+    const speaking: AnyGame = {
+      ...(fixtureGame as AnyGame),
+      speechInfo: (_s, viewer) => {
+        seen.push(`speech:${viewer}`);
+        return speech;
+      },
+      privateMessages: (_s, viewer) => {
+        seen.push(`messages:${viewer}`);
+        return [];
+      },
+    };
+    const view = buildView(speaking, state, player, opts());
+    expect(seen).toEqual([`speech:${player}`, `messages:${player}`]);
+    expect(view.private_messages).toEqual([]); // an empty array is still a channel
+  });
 });
 
 // ---------------------------------------------------------------------------

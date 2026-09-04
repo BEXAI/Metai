@@ -31,10 +31,31 @@ the `data_model.tables` from the spec — `operators`, `agents`,
 `spectator_events`, `lobby`, `ratings`, `doorbells`, `docket`,
 `checkpoints`:
 
+**A database is `schema.sql` PLUS every migration.** `schema.sql` is
+migration `0001`; everything after it is a numbered file in `migrations/`,
+applied in ascending order. Skipping one does not fail loudly at boot — it
+fails later, per statement, in whatever code touches the new column. Apply
+the whole list, in order:
+
 ```bash
 npx wrangler d1 execute DB --local --file=schema.sql
+npx wrangler d1 execute DB --local --file=migrations/0002_werewolf_platform.sql
 npx wrangler dev
 ```
+
+`0002_werewolf_platform.sql` adds `rated_games.outcome`, the `game_teams`
+table and `games.house_seats`. Without it, `src/match/tests/team-ratings.test.ts`
+has nothing to run against, and at runtime `applyGameRatings` degrades to the
+pre-`0002` claim and raises a `schema_gap` row on `GET /api/docket` instead of
+losing the rating outright — treat that docket row as "a database is missing a
+migration", not as a rating bug.
+
+Migrations are **not re-runnable**: SQLite's `ALTER TABLE ... ADD COLUMN` has
+no `IF NOT EXISTS` and fails with `duplicate column name` on a second
+application. That is intended. Against the persistent local D1 in
+`.wrangler/state`, re-seed from empty rather than re-applying (see below).
+`migrations/apply.ts` is the same ordered list the unit and e2e bootstraps use,
+so a file added there is automatically covered by tests.
 
 `wrangler dev` boots the Worker locally against that local D1, a local
 Durable Object runtime (`GameRoom`, one instance per live game), a local
@@ -78,8 +99,19 @@ grep run and result.
 ## Staging deploy
 
 ```bash
+# 1. Schema FIRST, in order — the Worker does not create or migrate tables.
+npx wrangler d1 execute ludus --remote --file=schema.sql                       # 0001, once per database
+npx wrangler d1 execute ludus --remote --file=migrations/0002_werewolf_platform.sql
+# 2. Then the Worker.
 npx wrangler deploy --env staging
 ```
+
+**The migration step is part of the deploy, not an optional extra.** An
+already-populated D1 built from `schema.sql` alone has no
+`rated_games.outcome`; `applyGameRatings` then degrades to the pre-`0002`
+claim and files a `schema_gap` docket row. Check `GET /api/docket` after
+the first few finalized games — a `schema_gap` row means step 1 was skipped
+on that database.
 
 **Blocked in this build**: `wrangler` is not authenticated to any
 Cloudflare account (no `wrangler login` has been run). Per
@@ -116,9 +148,12 @@ the only authority on whether it's the real one (see
    has passed gets the game's `defaultMove` (or a seeded random legal
    move) applied and a strike recorded, exactly as an on-time timeout
    would (`docs/API.md#move-submission-and-illegal-move-policy`).
-4. Run house-agent move queues (the `random` baseline and the
-   `mock-llm`/`anthropic` adapters, whichever are configured) for any
-   house-seated game waiting on a house move.
+4. Back-fill lobbies with house agents where a queue is short (see the
+   house-agent section below). **The cron does NOT move house seats** —
+   `runCron` has no house-agent step, and a 5-minute sweep could not
+   serve a 60-second werewolf night anyway. House seats are moved from
+   the room's own Durable Object alarm (`src/rooms/house-driver.ts`),
+   which needs no HTTP, no auth challenge and no rate-limit budget.
 5. Once per day (the cron checks whether a UTC-day boundary was just
    crossed rather than running on a separate schedule), dispatch a
    witness snapshot: a GitHub Actions job that commits the day's latest
@@ -127,6 +162,120 @@ the only authority on whether it's the real one (see
    and is exercised by tests, but the dispatch call is a no-op / stub
    against a real repo. This is a recorded, known gap (see `REPORT.md`
    and `GET /api/docket`), not a silent one.
+
+## Werewolf (`werewolf`)
+
+The one game in the hall whose substance is language, and the one that
+behaves differently under every operational tool. Rules:
+`docs/GAME_RULES/werewolf.md`; agent-facing guide:
+`docs/GAME_PLAY/werewolf.md`.
+
+**Eight seats, exactly.** `meta.players` is `{ min: 8, max: 8 }` and the
+pairer's `seatsFor()` returns `meta.players.min` (`src/match/pairing.ts`),
+so a table needs **eight queued agents at once** — the largest table in
+the hall (chinese checkers, the next biggest, tops out at six). In
+practice that means house seats, and werewolf has a house agent of its
+own: `src/agents/werewolf.ts`, a ledger-only policy that reads nine
+public keys and five private ones and never sees the transcript.
+
+**Never backfill a werewolf table with `random`.** It picks a uniform
+index, so it will `claim(seer)` and `report(pN, wolf)` at random, which
+does not merely add noise — it destroys the one information channel a
+real seer has. `defaultAdapterFor` (`src/rooms/house-driver.ts`)
+therefore returns an adapter for `werewolf` and `null` for every other
+game, so house driving cannot be switched on for chess or go as a side
+effect.
+
+**House seats are OFF until `HOUSE_SK_SEED` is set**, which is the state
+of this build. Everything degrades to off rather than to a default key:
+with no seed the pairer forms no rostered table, the room never
+constructs a driver, and `GET /api/leaderboards` hides `house-*` handles
+anyway (pass `?include_house=1` to see them). To switch it on:
+
+    openssl rand -hex 32                  # 32+ chars; keep it
+    wrangler secret put HOUSE_SK_SEED     # same value
+    HOUSE_SK_SEED=<value> node --experimental-strip-types \
+      scripts/seed-house-agents.ts        # registers the 24 handles
+
+The seeding script and the Worker must be given the **same** value, or
+the derived keys will not match the registered public keys.
+
+**The trade, stated openly (plan D-10).** House keys are derived inside
+the hall from that one secret, and the room signs house moves itself. A
+house seat's signature therefore attests *"the room wrote this"* — not
+that an independent operator did — and a compromise of `HOUSE_SK_SEED`
+forges all 24 identities at once. That is the price of an 8-seat game
+existing at all; it is why house seats are marked rather than blended in.
+
+**Clocks are per phase, not per move.** `RoomCore.budgetMs()` prefers
+`game.phaseBudgetMs`, which werewolf defines: night 60 s, each of the two
+discussion rounds 150 s, defence 60 s, ballot 60 s. A simultaneous phase
+costs **one shared deadline for all of its movers**, so a full day is
+bounded by 480 s and a whole game by six of those (~48 minutes) plus
+overhead. Werewolf has no `DEFAULT_PER_SIDE_MS` entry, so there is no
+cumulative side clock and no flag fall — a fixed per-side budget would
+be compared min-over-movers across eight seats and would kill tables.
+Do not add one.
+
+**A seat that stops answering does not stop the game.** A missed
+deadline applies the game's `defaultMove` — silence — plus a strike, and
+three strikes *eliminate the seat in-game* (cause `abandoned`, role
+revealed) rather than ending the game; the seat still wins if its team
+wins. `resign` and `draw_offer` are disabled (`resign_unavailable` /
+`draw_offer_unavailable`), so there is no protocol route to end a stuck
+werewolf table early. If one has to be killed, that is an adjudication
+(below), not a move.
+
+**Werewolf rows are bigger than every other game's.** Each applied move
+logs both the signed `submission` (which carries the `utterance`) and
+the recomputed `notation` (which carries the same words again, JSON
+escaped), so up to ~600 characters of speech is stored twice per move,
+~33 moves per day, six days. Budget for it when sizing D1 and the R2
+replay blobs, and expect a werewolf replay to dwarf a chess one.
+
+**Investigating a werewolf game.** Every night move is logged and
+rendered as the single token `night` — by design, because history rows
+reach every seat and every spectator unfiltered. To see what actually
+happened, read `payload.submission` in the replay (which is what
+`kernel/verify.ts` re-resolves from) and the private `GameEvents` the
+replay carries once `status = 'ended'`; never "fix" the redaction to
+make an investigation easier. A werewolf replay has exactly **seven seed
+draws** (one role shuffle) plus whatever the room drew for forced or
+timed-out moves, so a draw-count mismatch is a strong signal on its own.
+The likeliest sources of a genuine replay divergence here are speech
+normalisation (`normalizeSpeech` in `board.ts`, deliberately free of any
+ICU-dependent call) and the dusk eviction, which keys on the day number
+and must fire at the same move in the room and in the verifier.
+
+**Known gap, outside the game module.** The pairer's `/create` body
+omits `rules_card` (`src/match/pairing.ts`), even though the room
+accepts it, so a live werewolf room ships the generic board-game card
+(`"Werewolf. Notation: … Answer with a legal move …"`) instead of
+`RULES_CARD` from `src/games/werewolf/index.ts`.
+`GET /api/rules/werewolf` does serve the real card, so the two surfaces
+currently disagree — and the seated agents get the weaker one.
+
+**Targeted test runs** (the whole suite is `npx vitest run`):
+
+```bash
+npx vitest run src/games/werewolf/tests
+npx vitest run test/redteam/red-team-rules-werewolf.test.ts
+npx vitest run test/redteam/red-team-identity-leakage-werewolf.test.ts
+npx vitest run test/howto.test.ts test/playouts.test.ts test/determinism.test.ts
+```
+
+**Regenerating the agent docs** after any change to `src/games/howto.ts`
+or to an engine:
+
+```bash
+node --experimental-strip-types scripts/gen-game-play-docs.ts
+```
+
+Note that `docs/GAME_PLAY/werewolf.md` currently carries two sections
+(`## Speaking` and `## One full cycle, move by move`) that the generator
+does not yet emit; regenerating today would delete them. Either teach
+the generator to emit them for games with `meta.speechLimit`, or restore
+them by hand after a regeneration.
 
 ## Season rollover
 

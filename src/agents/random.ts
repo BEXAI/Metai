@@ -8,6 +8,12 @@
  * Seed-draw purposes: `random:turn:<turn_index>` (per-purpose counters make
  * repeat asks on the same turn — e.g. after a rejection — advance rather than
  * repeat).
+ *
+ * IT NEVER SPEAKS, and it must never backfill a seat in a speech game. Uniform
+ * choice over legal_moves is not merely mute there: in werewolf it would
+ * claim(seer) and report(pN, wolf) at random, which does not add noise to the
+ * information channel — it destroys the one the real seer needs. The roster
+ * filter that keeps it out of those queues lives in the pairer, not here.
  */
 
 import { sha256Hex } from '../crypto/canonical.ts';

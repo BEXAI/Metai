@@ -19,6 +19,18 @@
  *  - House backfill: an entry that has already waited 2+ sweeps gets its game
  *    filled with house agents (random baseline always present; mock/anthropic
  *    only when the HouseAgentProvider lists them).
+ *  - House eligibility is by ROSTER, not by kind (src/api/house.ts). A game
+ *    with a roster key draws only from that roster; a game without one draws
+ *    only from the general-purpose pool. Without this the 24 `house-ww-*` rows
+ *    would pass the {mock, anthropic} kind filter for chess, go, islanders and
+ *    landlord, and the moment they were seeded every 2-seat queue that had
+ *    waited two sweeps would start forming house-backfilled games in every game
+ *    type. Whether the other queues SHOULD backfill is a product decision, and
+ *    the pairer must not make it by accident.
+ *  - House fill is a LEAST-LOADED pick, not a random one, and no house agent is
+ *    seated twice in one sweep. The provider is a fixed array loaded once per
+ *    tick, so two anchors backfilled in the same sweep would otherwise seat the
+ *    same agent in both games.
  *
  * The pairer is deterministic given the lobby contents, PairerState, and the
  * SecretProvider — tests inject a fixed-seed provider.
@@ -40,6 +52,7 @@ import { getLatestRound, roundAt, type DrandFetch } from '../crypto/drand.ts';
 import { createSeedStream } from '../kernel/seed.ts';
 import { playerId, type Json } from '../kernel/types.ts';
 import type { ApiEnv } from '../api/env.ts';
+import { houseKeyringFrom, houseRosterFor, houseRosterOfHandle } from '../api/house.ts';
 import {
   lobbyEntryKey,
   queueKey,
@@ -48,6 +61,7 @@ import {
   type LobbyRepo,
   type LobbyRow,
 } from './lobby.ts';
+import { seatRowsOf } from './ratings.ts';
 import { seasonBounds, seasonIdFor } from './seasons.ts';
 
 // ---------------------------------------------------------------------------
@@ -86,6 +100,14 @@ export type HouseAgentKind = 'random' | 'mock' | 'anthropic';
 export interface HouseAgent {
   agent_id: string;
   kind: HouseAgentKind;
+  /**
+   * Roster key from the handle (houseRosterOfHandle): 'ww' for `house-ww-*`,
+   * absent for a general-purpose house agent. Eligibility compares this against
+   * houseRosterFor(game) — see eligibleHouseAgents.
+   */
+  roster?: string | null;
+  /** Live games this agent is already seated in; drives the least-loaded pick. */
+  load?: number;
 }
 
 export interface HouseAgentProvider {
@@ -94,8 +116,54 @@ export interface HouseAgentProvider {
    * include at least the random-baseline agents so no lobby starves
    * (spec §matchmaking_and_ratings.house_agents); mock/anthropic appear per
    * availability (no ANTHROPIC_API_KEY => no anthropic entries).
+   *
+   * `game` lets a provider narrow the pool itself; the sweep applies
+   * eligibleHouseAgents to whatever comes back regardless, so a provider that
+   * ignores the argument is still safe.
    */
-  available(): HouseAgent[];
+  available(game: string): HouseAgent[];
+}
+
+/**
+ * Roster filter + concurrency cap. Exported because it is the whole of rule
+ * D-5 and deserves its own assertions.
+ *
+ * `inSweep` counts seats this sweep has already handed out, so a house agent's
+ * effective load is current + pending: the concurrency cap holds across the
+ * tables formed inside one sweep, not just across sweeps.
+ */
+export function eligibleHouseAgents(
+  pool: readonly HouseAgent[],
+  game: string,
+  opts: { used?: ReadonlySet<string>; inSweep?: ReadonlyMap<string, number>; concurrency?: number } = {},
+): HouseAgent[] {
+  const roster = houseRosterFor(game);
+  const used = opts.used;
+  const inSweep = opts.inSweep;
+  const cap = opts.concurrency;
+  return pool.filter((h) => {
+    if ((h.roster ?? null) !== roster) return false;
+    if (used?.has(h.agent_id)) return false;
+    if (cap !== undefined) {
+      const load = (h.load ?? 0) + (inSweep?.get(h.agent_id) ?? 0);
+      if (load >= cap) return false;
+    }
+    return true;
+  });
+}
+
+/**
+ * The `need` least-loaded agents, ties broken by agent_id. Deterministic, and
+ * deliberately NOT a seeded shuffle: shuffle-and-slice spread live games
+ * unevenly across the roster, which is what made the concurrency budget the
+ * sizing depends on unusable. Seat ORDER inside the formed game is still a
+ * seeded shuffle.
+ */
+function leastLoaded(pool: readonly HouseAgent[], need: number, inSweep: ReadonlyMap<string, number>): HouseAgent[] {
+  const loadOf = (h: HouseAgent): number => (h.load ?? 0) + (inSweep.get(h.agent_id) ?? 0);
+  return [...pool]
+    .sort((a, b) => (loadOf(a) !== loadOf(b) ? loadOf(a) - loadOf(b) : a.agent_id < b.agent_id ? -1 : 1))
+    .slice(0, need);
 }
 
 export interface PairingAgentInfo {
@@ -138,6 +206,13 @@ export interface PairerConfig {
   bandStep?: number;
   unboundedAfterSweeps?: number;
   backfillAfterSweeps?: number;
+  /**
+   * Live games one house agent may sit in at once. Pass 2 never calls
+   * checkJoinQuota (it is wired only into postLobbyJoin), so this is the ONLY
+   * bound on house concurrency — a deliberate, documented exemption in the same
+   * spirit as the operator exemption above.
+   */
+  houseConcurrency?: number;
 }
 
 const DEFAULTS = {
@@ -145,6 +220,7 @@ const DEFAULTS = {
   bandStep: 100,
   unboundedAfterSweeps: 5,
   backfillAfterSweeps: 2,
+  houseConcurrency: 2,
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -160,9 +236,27 @@ export function initialPairerState(): PairerState {
   return { sweeps: {} };
 }
 
+/**
+ * A queue that wanted house backfill and could not get it. Without this the
+ * entry gets sweep credit and retries forever with NOTHING recorded anywhere —
+ * the failure mode is invisible, which for an 8-seat game that needs seven
+ * house agents is the most likely failure mode there is.
+ */
+export interface StarvedQueue {
+  game: string;
+  variant: string;
+  division: Division;
+  /** How many house seats the anchor's group still needed. */
+  need: number;
+  /** How many eligible house agents the pool actually offered. */
+  available: number;
+}
+
 export interface SweepOutcome {
   created: { game_id: string; command: CreateGameCommand }[];
   state: PairerState;
+  /** Queues that waited long enough for backfill and had no eligible pool. */
+  starved: StarvedQueue[];
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +294,7 @@ export async function runPairingSweep(
   const bandStep = cfg.bandStep ?? DEFAULTS.bandStep;
   const unboundedAfter = cfg.unboundedAfterSweeps ?? DEFAULTS.unboundedAfterSweeps;
   const backfillAfter = cfg.backfillAfterSweeps ?? DEFAULTS.backfillAfterSweeps;
+  const houseConcurrency = cfg.houseConcurrency ?? DEFAULTS.houseConcurrency;
 
   const rows = await lobby.list();
 
@@ -215,6 +310,12 @@ export async function runPairingSweep(
   const created: { game_id: string; command: CreateGameCommand }[] = [];
   const matchedKeys: LobbyKey[] = [];
   const nextSweeps: Record<string, number> = {};
+  const starved: StarvedQueue[] = [];
+  // HOISTED ABOVE THE QUEUE LOOP. The production provider is a fixed array
+  // loaded once per tick, so without these two the same house agent could be
+  // seated in two games formed by one sweep.
+  const usedHouse = new Set<string>();
+  const inSweepLoad = new Map<string, number>();
 
   // Deterministic queue order.
   const queueKeys = [...queues.keys()].sort();
@@ -259,6 +360,10 @@ export async function runPairingSweep(
       };
       const game_id = await cfg.factory.createGame(command);
       created.push({ game_id, command });
+      for (const h of houseFill) {
+        usedHouse.add(h.agent_id);
+        inSweepLoad.set(h.agent_id, (inSweepLoad.get(h.agent_id) ?? 0) + 1);
+      }
       for (const c of group) {
         unmatched.delete(c);
         matchedKeys.push({ ...queue, agent_id: c.row.agent_id });
@@ -292,12 +397,29 @@ export async function runPairingSweep(
       }
       const need = seats - group.length;
       if (need > 0) {
-        const pool = cfg.houseAgents.available();
-        if (pool.length < need) continue; // provider must list enough distinct agents
-        const secret = cfg.secrets.secret();
-        const seed = createSeedStream(sha256Hex(secret));
-        const fill = seed.shuffle('pairing:house', pool).slice(0, need);
-        await formGame(group, fill);
+        // The cap applies to ROSTERED games only. It exists to protect
+        // werewolf's sizing budget — 24 rostered agents, 7 seats a table — and
+        // applying it to the twelve pre-werewolf games would retroactively
+        // change their backfill: the general-purpose pool is small, so once
+        // each of its agents sits in two live games a lone chess/go/hex
+        // entrant stops being backfilled at all, silently, and then takes the
+        // `starved` path that writes a docket row and a KV key on a path that
+        // runs on every lobby join. The cap must not manufacture the
+        // starvation its own reporter then bills for.
+        const pool = eligibleHouseAgents(cfg.houseAgents.available(queue.game), queue.game, {
+          used: usedHouse,
+          inSweep: inSweepLoad,
+          ...(houseRosterFor(queue.game) === null ? {} : { concurrency: houseConcurrency }),
+        });
+        if (pool.length < need) {
+          // The entry still gets sweep credit and retries, but the starvation
+          // is now RECORDED instead of silent. One row per queue per sweep: the
+          // anchor loop can hit this for every waiting entry in the queue and
+          // they are all the same fact.
+          if (!starved.some((s) => queueKey(s) === qk)) starved.push({ ...queue, need, available: pool.length });
+          continue;
+        }
+        await formGame(group, leastLoaded(pool, need, inSweepLoad));
       } else {
         await formGame(group, []);
       }
@@ -310,7 +432,7 @@ export async function runPairingSweep(
   }
 
   await lobby.remove(matchedKeys);
-  return { created, state: { sweeps: nextSweeps } };
+  return { created, state: { sweeps: nextSweeps }, starved };
 }
 
 // ---------------------------------------------------------------------------
@@ -464,6 +586,13 @@ export function d1GameFactory(env: ApiEnv, opts: D1FactoryOptions): GameFactory 
       }
 
       const variant = variantConfigOf(cmd.variant);
+      // A game that ships its own rules card gets it in the room, not the
+      // room's generic "answer with a legal move" fallback. Werewolf is the
+      // only one today, and its card is the difference between an agent that
+      // knows it has a role and one that does not — GET /api/rules/:game has
+      // always served it, so without this the two surfaces disagree. Read
+      // structurally: AnyGame has no rulesCard field (getRules does the same).
+      const rulesCard = (env.games[cmd.game] as { rulesCard?: unknown } | undefined)?.rulesCard;
       const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(gameId));
       const createRes = await stub.fetch('https://room/create', {
         method: 'POST',
@@ -478,6 +607,7 @@ export function d1GameFactory(env: ApiEnv, opts: D1FactoryOptions): GameFactory 
           secret_hex: secretHex,
           drand_round: drandRound,
           drand_randomness: drandRandomness,
+          ...(typeof rulesCard === 'string' ? { rules_card: rulesCard } : {}),
           // Test-only clock override (never set in production); otherwise the
           // room uses its generous per-game default (src/rooms/core.ts).
           ...(env.perMoveMsOverride ? { per_move_ms: env.perMoveMsOverride } : {}),
@@ -536,19 +666,109 @@ function houseKindOf(handle: string): HouseAgentKind {
   return 'random';
 }
 
+export interface HouseAgentRow {
+  id: string;
+  handle: string;
+  /** Live games this agent already sits in (the concurrency filter). */
+  live_games?: number;
+}
+
+/**
+ * Rows -> pool. Pure, so the two rules that keep the roster honest are
+ * assertable without a database:
+ *
+ *  - 'anthropic' entries are dropped: the narrow ApiEnv carries no
+ *    ANTHROPIC_API_KEY, so only random/mock house agents can actually play.
+ *  - a ROSTERED agent (`house-ww-*`) is dropped entirely when the house keys
+ *    are not configured. Seating one would form an 8-seat table whose seven
+ *    house seats can never sign a move: every phase would time out, every seat
+ *    would take a strike, and the table would die in three phases having burned
+ *    a real agent's game. Backfill OFF is the correct degradation.
+ */
+export function houseAgentsFromRows(
+  rows: readonly HouseAgentRow[],
+  opts: { keysConfigured: boolean },
+): HouseAgent[] {
+  const out: HouseAgent[] = [];
+  for (const r of rows) {
+    const kind = houseKindOf(r.handle);
+    if (kind === 'anthropic') continue;
+    const roster = houseRosterOfHandle(r.handle);
+    if (roster !== null && !opts.keysConfigured) continue;
+    out.push({ agent_id: r.id, kind, roster, load: Number(r.live_games ?? 0) });
+  }
+  return out;
+}
+
 /**
  * House agents registered for backfill: active agents whose handle starts
  * with 'house-' (the public convention; they register and homologate like
- * everyone else). 'anthropic' entries are excluded here — the narrow ApiEnv
- * carries no ANTHROPIC_API_KEY, so only random/mock house agents backfill.
+ * everyone else), each carrying its live-game count so the fill can be
+ * least-loaded and capped by policy.houseConcurrency.
  */
-async function loadHouseAgents(env: ApiEnv): Promise<HouseAgent[]> {
-  const { results } = await env.DB
-    .prepare("SELECT id, handle FROM agents WHERE status = 'active' AND handle LIKE 'house-%' ORDER BY handle")
-    .all<{ id: string; handle: string }>();
-  return results
-    .map((r) => ({ agent_id: r.id, kind: houseKindOf(r.handle) }))
-    .filter((h) => h.kind !== 'anthropic');
+async function loadHouseAgents(env: ApiEnv, keysConfigured: boolean): Promise<HouseAgent[]> {
+  // TWO flat queries, never a correlated subquery per agent. The obvious
+  // spelling — `(SELECT COUNT(*) FROM games WHERE status='live' AND seats_json
+  // LIKE '%"'||a.id||'"%')` as a column — cannot use an index for the LIKE, so
+  // it scans every live game ONCE PER HOUSE AGENT. With the planned 24-agent
+  // werewolf roster plus the general pool that is ~27 scans of the live-games
+  // set on a path that runs on EVERY LOBBY JOIN (cronTick), not just the
+  // 5-minute cron: ~1,350 rows read per join at 50 concurrent games, against a
+  // budget two numbers that only grow. One scan, tallied in JS, is the same
+  // answer for a constant number of queries.
+  const [agents, live] = await Promise.all([
+    env.DB
+      .prepare("SELECT id, handle FROM agents WHERE status = 'active' AND handle LIKE 'house-%' ORDER BY handle")
+      .all<{ id: string; handle: string }>(),
+    env.DB.prepare("SELECT seats_json FROM games WHERE status = 'live'").all<{ seats_json: string | null }>(),
+  ]);
+  const loads = new Map<string, number>();
+  for (const g of live.results ?? []) {
+    for (const s of seatRowsOf(g.seats_json)) loads.set(s.agent_id, (loads.get(s.agent_id) ?? 0) + 1);
+  }
+  const rows: HouseAgentRow[] = (agents.results ?? []).map((a) => ({
+    id: a.id,
+    handle: a.handle,
+    live_games: loads.get(a.id) ?? 0,
+  }));
+  return houseAgentsFromRows(rows, { keysConfigured });
+}
+
+/**
+ * A `lobby_starved` docket row, rate-limited by a KV marker. Guarded end to
+ * end: the sweep has already created games and cleared lobby rows by the time
+ * this runs, so nothing here may throw.
+ *
+ * THE TTL IS A BUDGET, NOT A PREFERENCE. This is a KV WRITE on the cronTick
+ * path, and cronTick runs on every lobby join as well as every 5 minutes. At an
+ * hour, ~13 games x 2 divisions of persistently starved queues is ~600
+ * writes/day against a free-plan ceiling of ~1,000 — the same class of quota
+ * burn that took authentication down once already (see the KV note further
+ * down this file). Six hours puts the worst case near 100/day, and a queue that
+ * is still starving six hours later is the same fact, not news.
+ */
+const STARVED_MARKER_TTL_S = 6 * 3600;
+
+async function recordStarvation(env: ApiEnv, starved: readonly StarvedQueue[]): Promise<void> {
+  for (const s of starved) {
+    const marker = `starved:${queueKey(s)}`;
+    try {
+      if (await env.CACHE.get(marker)) continue;
+      await env.DB
+        .prepare("INSERT INTO docket (kind, subject_json, reason, disposition, created_at) VALUES (?, ?, ?, 'noted', ?)")
+        .bind(
+          'lobby_starved',
+          JSON.stringify({ game: s.game, variant: s.variant, division: s.division }),
+          `house backfill wanted ${s.need} seats for ${s.game}; ${s.available} eligible house agents available` +
+            (houseRosterFor(s.game) === null ? '' : ' (rostered game: check HOUSE_SK_SEED and the seeded roster)'),
+          new Date(env.now()).toISOString(),
+        )
+        .run();
+      await env.CACHE.put(marker, '1', { expirationTtl: STARVED_MARKER_TTL_S });
+    } catch (e) {
+      console.warn(`pairer: could not record lobby starvation: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
 }
 
 export interface CronTickOptions {
@@ -595,7 +815,10 @@ export async function cronTick(env: ApiEnv, opts: CronTickOptions = {}): Promise
       /* fresh state */
     }
 
-    const house = await loadHouseAgents(env);
+    // No HOUSE_SK_SEED => no derived keys => no rostered backfill at all.
+    // houseKeyringFrom never throws and never falls back to a baked-in key.
+    const keysConfigured = houseKeyringFrom(env) !== null;
+    const house = await loadHouseAgents(env, keysConfigured);
     const secrets = opts.secrets ?? new CryptoSecretProvider();
     const factoryOpts: D1FactoryOptions = { secrets, seasonId };
     if (opts.drandFetch) factoryOpts.drandFetch = opts.drandFetch;
@@ -632,6 +855,8 @@ export async function cronTick(env: ApiEnv, opts: CronTickOptions = {}): Promise
       secrets,
       factory: d1GameFactory(env, factoryOpts),
     });
+
+    await recordStarvation(env, outcome.starved);
 
     // Write ONLY when the sweep counters actually changed. cronTick runs on
     // every lobby join as well as every 5 minutes, and the overwhelming

@@ -17,6 +17,7 @@ import chinese_checkers from './chinese_checkers/index.ts';
 import backgammon from './backgammon/index.ts';
 import landlord from './landlord/index.ts';
 import islanders from './islanders/index.ts';
+import werewolf from './werewolf/index.ts';
 
 export const GAMES: Record<string, AnyGame> = {
   tictactoe,
@@ -31,6 +32,7 @@ export const GAMES: Record<string, AnyGame> = {
   backgammon,
   landlord,
   islanders,
+  werewolf,
 };
 
 export function getGame(id: string): AnyGame | undefined {

@@ -152,7 +152,13 @@ describe('GameRoom Durable Object', () => {
     const reader = (sse.body as ReadableStream<Uint8Array>).getReader();
     const chunk = await reader.read();
     const text = new TextDecoder().decode(chunk.value);
-    expect(text).toContain('event: start');
+    // Frames are UNNAMED (no `event:` line) so EventSource delivers every one
+    // of them — including the open-ended `game:*` namespace — to the default
+    // 'message' listener the /watch client registers. See sseFrame in room.ts.
+    // The type is inside the JSON payload, so assert on that instead.
+    expect(text).toContain(`retry: `);
+    expect(text, 'a named frame is dropped by EventSource; frames must be unnamed').not.toContain('event: ');
+    expect(text).toMatch(/id: \d+\ndata: \{[^\n]*"type":"start"/);
     await reader.cancel();
   });
 
@@ -179,6 +185,39 @@ describe('GameRoom Durable Object', () => {
     await room.alarm();
     const state2 = (await (await room.fetch(req('/state'))).json()) as { turn_index: number };
     expect(state2.turn_index).toBe(2);
+  });
+
+  it('a house seat in a game with NO house policy is never armed, so the alarm cannot loop', async () => {
+    // REGRESSION. arm() counted house seats by HANDLE while drive() picked
+    // them by ADAPTER, and the only game with an adapter is werewolf. So a
+    // house-backfilled chess/go/mini table armed a driver that could never
+    // move it: every wake, drive() stood down and wrote null, persist()
+    // re-armed HOUSE_MOVE_DELAY_MS out, and the room woke and wrote twice
+    // every 3 s for the whole per-move budget while nothing progressed
+    // (~20x on chess, ~100x on the 5-minute default) — dormant only because
+    // HOUSE_SK_SEED is unset, which the RUNBOOK presents as safe to set.
+    const storage = new MockStorage();
+    const houseSeats = [
+      seats[0]!,
+      { ...seats[1]!, handle: 'house-random-1' },
+    ];
+    const room = new GameRoom({ storage }, { HOUSE_SK_SEED: 'x'.repeat(48) });
+    await room.fetch(req('/create', { ...createBody, seats: houseSeats, per_move_ms: 600_000 }));
+
+    expect(storage.alarmAt).not.toBeNull();
+    const move = await room.fetch(req('/move', signedMoveBody(0, 0, { index: 0 })));
+    expect(move.status).toBe(200);
+
+    // The alarm still points at the ordinary MOVE DEADLINE (~600 s out), not at
+    // HOUSE_MOVE_DELAY_MS (3 s), and no house due time was written at all.
+    expect(storage.alarmAt! - Date.now()).toBeGreaterThan(500_000);
+    expect(storage.data.has('housedue')).toBe(false);
+
+    // And it stays that way across wakes — the old bug re-armed 3 s out on
+    // every single one of them, forever.
+    for (let i = 0; i < 5; i++) await room.alarm();
+    expect(storage.alarmAt! - Date.now()).toBeGreaterThan(500_000);
+    expect(storage.data.has('housedue')).toBe(false);
   });
 
   it('404s before create and on unknown routes; 400s on unknown games', async () => {

@@ -7,6 +7,11 @@
 -- file is never edited destructively once deployed. Every statement is
 -- IF NOT EXISTS so re-running is harmless.
 --
+-- THIS FILE ALONE IS NO LONGER A COMPLETE DATABASE. Apply migrations/*.sql
+-- after it, in ascending order — migrations/apply.ts is the ordered list, and
+-- both test bootstraps (src/api/tests/fakes.ts, test/e2e/harness.ts) go
+-- through it so no DDL can exist in production and nowhere else.
+--
 -- Invariants enforced above the schema (data_model.rules):
 --   * games.reveal_secret and private_views never join into a public
 --     response before games.ended_at (src/api/handlers.ts).

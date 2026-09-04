@@ -7,8 +7,9 @@
  *    standing — enforced by T7's identity layer; the pin lives here).
  *  - Rating periods close daily at 00:00 UTC: all games that ENDED inside the
  *    period are collected per (game, variant, division, season) and every
- *    agent gets ONE Glicko-2 update containing all its pairwise results from
- *    the period, with opponents at their start-of-period ratings.
+ *    agent gets ONE Glicko-2 update containing all its decomposed results from
+ *    the period (pairwise, or team-aggregate for a game whose result carries
+ *    teams), with opponents at their start-of-period ratings.
  *  - Idle rated agents get the paper's no-game update (RD grows, capped 350).
  *  - Season close produces final tables: wins, losses, draws, rating, games
  *    played (spec: "Season tables publish wins, losses, draws, rating, and
@@ -20,17 +21,11 @@
 
 import { canonicalJson } from '../crypto/canonical.ts';
 import type { GameResult, Json } from '../kernel/types.ts';
-import {
-  DEFAULT_GLICKO2,
-  isProvisional,
-  pairwiseResults,
-  rate,
-  standingsFromResult,
-  type Glicko2Rating,
-  type Glicko2Result,
-  type Standing,
-} from './glicko2.ts';
+import { DEFAULT_GLICKO2, rate, type Glicko2Rating, type Glicko2Result } from './glicko2.ts';
 import type { Division } from './lobby.ts';
+// The decomposition and the provisional threshold live with the per-game
+// applier so the two cannot diverge; see the cycle note in ratings.ts.
+import { decomposeGame, isProvisionalFor } from './ratings.ts';
 
 // ---------------------------------------------------------------------------
 // Season rows and calendar math (all UTC)
@@ -196,9 +191,13 @@ export interface RatingPeriodReport {
 
 /**
  * Closes one daily rating period: every agent that finished games gets one
- * batched Glicko-2 update (all pairwise results, opponents at start-of-period
+ * batched Glicko-2 update (all decomposed results, opponents at start-of-period
  * ratings); every other rated agent gets the no-game RD inflation
  * (set inflateIdle false to skip). games_played += games finished (not pairs).
+ *
+ * This is the OFFLINE rebuild of what applyGameRatings applies per game, so it
+ * shares decomposeGame with it — a period that branched on teams differently
+ * from the live applier would produce a rebuild that silently disagrees.
  */
 export async function closeRatingPeriod(
   periodEndUtc: string,
@@ -244,16 +243,13 @@ export async function closeRatingPeriod(
       });
     }
 
-    // Pairwise results per agent across all games in the period.
+    // Decomposed results per agent across all games in the period — pairwise,
+    // or team-aggregate for a game whose result carries teams.
     const resultsByAgent = new Map<string, Glicko2Result[]>();
     const gamesByAgent = new Map<string, number>();
     for (const fg of games) {
-      const standings: Standing[] = standingsFromResult(fg.seat_agents, fg.result).map((s) => ({
-        agent_id: s.agent_id,
-        position: s.position,
-        rating: baseline.get(s.agent_id)!.rating,
-      }));
-      for (const [agent_id, results] of pairwiseResults(standings)) {
+      const decomposed = decomposeGame(fg.seat_agents, fg.result, (id) => baseline.get(id)!.rating);
+      for (const [agent_id, results] of decomposed) {
         const acc = resultsByAgent.get(agent_id);
         if (acc) acc.push(...results);
         else resultsByAgent.set(agent_id, [...results]);
@@ -376,7 +372,7 @@ export async function closeSeason(
       agent_id: row.agent_id,
       rating: row.rating,
       rd: row.rd,
-      provisional: isProvisional(row.games_played),
+      provisional: isProvisionalFor(row.games_played, row.game),
       games_played: row.games_played,
       wins: t.wins,
       losses: t.losses,

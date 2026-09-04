@@ -27,6 +27,8 @@ import { checkJoinQuota, spendJoin } from './quota.ts';
 import { buildHowto } from '../games/howto.ts';
 import { createSeedStream } from '../kernel/seed.ts';
 import { cronTick } from '../match/pairing.ts';
+import { isProvisionalFor } from '../match/ratings.ts';
+import { houseKeyringFrom, houseRosterFor } from './house.ts';
 
 // ---------------------------------------------------------------------------
 // Request shape the router and the MCP server both construct
@@ -269,7 +271,27 @@ interface PublicEventRow {
   created_at: string;
 }
 
-const EVENTS_UNTRUSTED = ['data.events[].event.data.commentary'];
+/**
+ * Every agent-authored string in the spectator feed.
+ *
+ * `notation` is on this list because a speech game's words ride INSIDE it
+ * (`accuse(p3) "you dodged the check"` — src/rooms/core.ts stamps the applied
+ * notation onto the move event verbatim), and `public.transcript[].text` is
+ * the whole current day of prose, the single largest agent-authored surface in
+ * the product. `board_text` stays off it: the dossier is engine-authored, and
+ * a game that printed the transcript into it would be the fence hole itself.
+ */
+const EVENTS_UNTRUSTED = [
+  'data.events[].event.data.commentary',
+  'data.events[].event.data.notation',
+  'data.events[].event.data.public.transcript[].text',
+  // `game:*` events nest the game module's own payload one level deeper
+  // (src/rooms/core.ts emitGameEvents: { turn_index, player, data: ev.data }),
+  // and `game:speech` is werewolf's PRIMARY live prose channel — the one
+  // /watch folds into the theater. Declaring only the transcript would leave
+  // the larger of the two surfaces undeclared.
+  'data.events[].event.data.data.text',
+];
 const EVENTS_PAGE_LIMIT = 500;
 
 function eventsEnvelope(gameId: string, since: number, events: PublicEventRow[]): ApiResult {
@@ -336,6 +358,19 @@ const getGameEvents: Handler = async (env, req) => {
   return eventsEnvelope(id, since, events);
 };
 
+/**
+ * The replay is the signed record, so it carries an agent's words twice over:
+ * once as the submission it signed (`utterance`, or a notation string it typed
+ * itself) and once as the notation the engine recomputed from it. Both are
+ * verbatim agent text and both are declared.
+ */
+const REPLAY_UNTRUSTED = [
+  'data.replay.log[].payload.submission.commentary',
+  'data.replay.log[].payload.submission.utterance',
+  'data.replay.log[].payload.submission.move',
+  'data.replay.log[].payload.notation',
+];
+
 const getGameReplay: Handler = async (env, req) => {
   const id = req.params.id ?? '';
   const row = await getGameRow(env, id);
@@ -348,7 +383,7 @@ const getGameReplay: Handler = async (env, req) => {
     const obj = await env.REPLAYS.get(key);
     if (obj) {
       const raw = await obj.text();
-      return ok({ replay: JSON.parse(raw) as Json }, ['data.replay.log[].payload.submission.commentary']);
+      return ok({ replay: JSON.parse(raw) as Json }, REPLAY_UNTRUSTED);
     }
   } catch {
     /* fall through to D1 */
@@ -448,7 +483,7 @@ const getGameReplay: Handler = async (env, req) => {
     seed_draws: seedDraws as unknown as Json,
     reconstructed_from: recomputed ? 'd1+recomputed-initial-state' : 'd1',
   };
-  return ok({ replay }, ['data.replay.log[].payload.submission.commentary']);
+  return ok({ replay }, REPLAY_UNTRUSTED);
 };
 
 const getAgentProfile: Handler = async (env, req) => {
@@ -527,6 +562,14 @@ const getLeaderboards: Handler = async (env, req) => {
       filters[param] = v;
     }
   }
+  // House agents (src/api/house.ts) exist so an 8-seat table can form at all,
+  // not to compete: their keys are derived by the hall from one secret, so a
+  // house rating is the hall's rating of itself. Hide them by default — and do
+  // it in SQL, because the board is LIMIT 100 and a client-side filter would
+  // let them push real agents off the end. ?include_house=1 shows them.
+  const includeHouse = req.query.get('include_house') === '1';
+  if (includeHouse) filters.include_house = '1';
+  else clauses.push("a.handle NOT LIKE 'house-%'");
   const where = clauses.length > 0 ? ` WHERE ${clauses.join(' AND ')}` : '';
   const { results } = await env.DB
     .prepare(
@@ -548,7 +591,10 @@ const getLeaderboards: Handler = async (env, req) => {
     rd: r.rd as Json,
     volatility: r.volatility as Json,
     games_played: r.games_played as Json,
-    provisional: Number(r.games_played) < 20,
+    // Per game, not a flat 20: werewolf's result is one draw from an 8-seat
+    // social game, so it needs more games before a rating means anything
+    // (src/match/ratings.ts#provisionalGamesFor).
+    provisional: isProvisionalFor(Number(r.games_played), String(r.game)),
     updated_at: r.updated_at as Json,
   }));
   return ok({ filters, leaderboard: rows }, ['data.leaderboard[].handle']);
@@ -864,13 +910,28 @@ async function fetchViewFor(env: ApiEnv, gameRow: GameRow, agentId: string): Pro
   return err(503, 'ROOM_UNAVAILABLE', 'The game room is unavailable and no stored view exists yet; retry shortly.');
 }
 
+/**
+ * The three fenced view fields, and only those three. `history[].notation`
+ * carries the speaker's words in a speech game; `private_messages[].text` is
+ * another seat's whisper; `public.transcript[].text` is the current day of
+ * prose. Everything else in a view — board_text, state_string, private,
+ * legal_moves — is engine-authored by construction, which is what lets
+ * src/agents/prompt.ts render it outside the untrusted fence.
+ */
+const VIEW_UNTRUSTED = [
+  'data.view.history[].commentary',
+  'data.view.history[].notation',
+  'data.view.private_messages[].text',
+  'data.view.public.transcript[].text',
+];
+
 const getGameView: Handler = async (env, req) => {
   const { ctx, res } = await requireAuth(env, req);
   if (!ctx) return res!;
   const gameRow = await getGameRow(env, req.params.id ?? '');
   if (!gameRow) return err(404, 'GAME_NOT_FOUND', `No game '${req.params.id ?? ''}'.`);
   const result = await fetchViewFor(env, gameRow, ctx.agent.id);
-  if ('view' in result) return ok({ view: result.view }, ['data.view.history[].commentary']);
+  if ('view' in result) return ok({ view: result.view }, VIEW_UNTRUSTED);
   return result;
 };
 
@@ -884,7 +945,15 @@ const getGameLegalMoves: Handler = async (env, req) => {
   const view = result.view;
   const legal = isRecord(view) ? (view.legal_moves ?? []) : [];
   const turn = isRecord(view) ? (view.turn_index ?? null) : null;
-  return ok({ game_id: gameRow.id, turn_index: turn, legal_moves: legal });
+  // The speech channel rides along: without it an agent on this route sees
+  // eight notations all reading `night` and no sign that words are part of a
+  // move at all — which by day is the decisive part. It is engine-authored
+  // (a limit, an audience and one house-written note), so this response STILL
+  // declares no untrusted fields, and a test pins that.
+  const speech = isRecord(view) ? view.speech : undefined;
+  const payload: Record<string, Json> = { game_id: gameRow.id, turn_index: turn, legal_moves: legal };
+  if (speech !== undefined) payload.speech = speech;
+  return ok(payload);
 };
 
 // ---------------------------------------------------------------------------
@@ -984,17 +1053,37 @@ const postLobbyJoin: Handler = async (env, req) => {
     .bind(body.game, body.variant, body.division, ctx.agent.id)
     .first();
   const paired = !stillWaiting;
-  return ok(
-    {
-      joined: body as unknown as Json,
-      paired,
-      note: paired
-        ? 'Paired — a game has been created for you. Poll GET /api/my/games (or /api/pulse) for your seat, then GET /api/games/<id>/view on your turn.'
-        : 'Queued. A game forms the moment enough seats fill (a sweep runs on every join and every 5 minutes). Poll /api/pulse or register a doorbell.',
-    },
-    undefined,
-    201,
-  );
+  const data: Record<string, Json> = { joined: body as unknown as Json, paired };
+  if (paired) {
+    data['note'] =
+      'Paired — a game has been created for you. Poll GET /api/my/games (or /api/pulse) for your seat, then GET /api/games/<id>/view on your turn.';
+    return ok(data, undefined, 201);
+  }
+
+  // QUEUED: say WHY, with numbers. An 8-seat game is the first table in this
+  // hall a lone entrant cannot fill, and the only record of that today is a
+  // once-an-hour docket row nothing links to — so an agent that queues for
+  // werewolf alone waits forever and is told nothing. These three fields are
+  // the whole explanation, and they are two cheap reads on a path that has
+  // already run a pairing sweep.
+  const seatsRequired = lookupGame(env, body.game)?.meta.players.min ?? 2;
+  const queued = await env.DB
+    .prepare('SELECT COUNT(*) AS n FROM lobby WHERE game = ? AND variant = ? AND division = ?')
+    .bind(body.game, body.variant, body.division)
+    .first<{ n: number }>();
+  const inQueue = Number(queued?.n ?? 1);
+  data['seats_required'] = seatsRequired;
+  data['in_queue'] = inQueue;
+  // A rostered game with no HOUSE_SK_SEED has NO backfill at all: the roster
+  // rows exist but every one of them is dropped for want of a key, so the
+  // table needs `seats_required` real agents and no amount of waiting changes
+  // that. Say so rather than letting the agent infer it from silence.
+  const backfillOff = houseRosterFor(body.game) !== null && houseKeyringFrom(env) === null;
+  data['house_backfill'] = backfillOff ? 'unavailable' : 'possible';
+  data['note'] = backfillOff
+    ? `Queued (${inQueue} of ${seatsRequired} seats). House backfill is NOT configured for '${body.game}', so this table needs ${seatsRequired} real agents. A sweep runs on every join and every 5 minutes. Poll /api/pulse or register a doorbell.`
+    : `Queued (${inQueue} of ${seatsRequired} seats). A game forms the moment enough seats fill, by real agents or by house backfill after a short wait (a sweep runs on every join and every 5 minutes). Poll /api/pulse or register a doorbell.`;
+  return ok(data, undefined, 201);
 };
 
 const postLobbyLeave: Handler = async (env, req) => {
@@ -1014,6 +1103,34 @@ const postLobbyLeave: Handler = async (env, req) => {
   return ok({ left: body as unknown as Json });
 };
 
+/**
+ * Transport ceilings for the two agent-authored MOVE fields. Both sit well
+ * above the largest in-game limit in the hall (werewolf's meta.speechLimit is
+ * 600, and a notation quotes those words with JSON escaping), so a legitimate
+ * submission never meets them.
+ *
+ * A rejection here happens BEFORE auth and before the room is called, so — as
+ * with every other 4xx on this route — it costs the agent nothing: no strike,
+ * no consumed turn, no spent challenge.
+ */
+const MOVE_NOTATION_MAX = 4000;
+const UTTERANCE_MAX = 4000;
+
+/**
+ * The accepted-move verdict is not just an acknowledgement: it carries the
+ * spectator events the submission produced (src/rooms/core.ts okResult), and
+ * when a simultaneous phase resolves on this call those are EVERY seat's
+ * moves — other agents' notation, commentary and transcript. Same strings as
+ * the events feed, so the same declaration.
+ */
+const VERDICT_UNTRUSTED = [
+  'data.verdict.events[].data.commentary',
+  'data.verdict.events[].data.notation',
+  'data.verdict.events[].data.public.transcript[].text',
+  // The nested `game:*` payload, exactly as on the events feed above.
+  'data.verdict.events[].data.data.text',
+];
+
 const postMove: Handler = async (env, req) => {
   const json = req.json;
   if (!isRecord(json)) return err(400, 'BAD_BODY', 'Body must be a JSON MoveSubmission object.');
@@ -1030,8 +1147,23 @@ const postMove: Handler = async (env, req) => {
   if (!moveOk && !isAction) {
     return err(400, 'BAD_MOVE', "move must be a notation string or { index: n } (or set resign/draw_offer true).");
   }
+  // A notation string carries in-game speech in a speech game, so it was the
+  // one unbounded field on this route. The ceiling is deliberately far above
+  // any game's own limit: the GAME rejects over-length text with the exact
+  // character count (and does not consume the turn), which is the error an
+  // agent should normally see. This one only stops a submission from being a
+  // megabyte.
+  if (typeof move === 'string' && move.length > MOVE_NOTATION_MAX) {
+    return err(400, 'MOVE_TOO_LONG', `move notation must be at most ${MOVE_NOTATION_MAX} characters (got ${move.length}).`);
+  }
   if (json.commentary !== undefined && (typeof json.commentary !== 'string' || json.commentary.length > 280)) {
     return err(400, 'BAD_COMMENTARY', 'commentary must be a string of at most 280 characters.');
+  }
+  // In-game speech: part of the MOVE, not an aside. The per-phase cap belongs
+  // to the game (which caps rather than rejects, so a long utterance never
+  // costs a turn); this is the transport-level bound and a type check.
+  if (json.utterance !== undefined && (typeof json.utterance !== 'string' || json.utterance.length > UTTERANCE_MAX)) {
+    return err(400, 'BAD_UTTERANCE', `utterance must be a string of at most ${UTTERANCE_MAX} characters.`);
   }
   if (typeof json.signature !== 'string' || !/^[0-9a-f]{128}$/.test(json.signature)) {
     return err(400, 'BAD_SIGNATURE', "signature must be 128 hex chars: Ed25519 over 'ludus.move.v1:'+game_id+':'+turn_index+':'+sha256Hex(canonicalJson(body without signature)).");
@@ -1061,7 +1193,7 @@ const postMove: Handler = async (env, req) => {
   // legal list / strike) inside the standard envelope.
   try {
     const verdict = (await roomRes.json()) as Json;
-    if (roomRes.ok) return ok({ verdict }, undefined, roomRes.status);
+    if (roomRes.ok) return ok({ verdict }, VERDICT_UNTRUSTED, roomRes.status);
     // The room's reject body is flat: { ok:false, code, message,
     // illegal_attempt?, legal_moves? } (src/rooms/core.ts SubmitReject).
     // Surface ITS code/message as error.code/error.message so clients can

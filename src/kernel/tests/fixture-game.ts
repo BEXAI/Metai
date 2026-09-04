@@ -257,19 +257,20 @@ export function buildFixtureReplay(): ReplayFile {
     const applied = fixtureGame.apply(state, player, move, seed);
     if (isRuleError(applied)) throw new Error(`fixture apply failed: ${applied.message}`);
     state = applied.state;
-    push(
-      'move',
-      {
-        turn_index: turn,
-        player,
-        agent_id: `a_${player}`,
-        submission,
-        notation,
-        state_hash: hashState(state),
-        draws: JSON.parse(JSON.stringify(seed.draws().slice(before))) as Json,
-      },
-      signMoveMessage(keys[player]!, gameId, turn, submission),
-    );
+    const payload: Record<string, Json> = {
+      turn_index: turn,
+      player,
+      agent_id: `a_${player}`,
+      submission,
+      notation,
+      state_hash: hashState(state),
+      draws: JSON.parse(JSON.stringify(seed.draws().slice(before))) as Json,
+    };
+    // Rooms log apply()'s events whenever it emitted any, and the verifier now
+    // recomputes them (a deleted event is a tamper the state hash cannot see).
+    // Same guard as rooms/core.ts: the key is written only when non-empty.
+    if (applied.events.length > 0) payload.events = applied.events as unknown as Json;
+    push('move', payload, signMoveMessage(keys[player]!, gameId, turn, submission));
   }
 
   const result = fixtureGame.isTerminal(state);
