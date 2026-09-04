@@ -337,10 +337,18 @@ export class LudusClient {
     gameId: string,
     turnIndex: number,
     move: string | { index: number },
-    opts: { commentary?: string; resign?: boolean; draw_offer?: boolean; transport?: Transport } = {},
+    opts: {
+      commentary?: string;
+      /** In-game speech (speech games only); signed with the rest of the body. */
+      utterance?: string;
+      resign?: boolean;
+      draw_offer?: boolean;
+      transport?: Transport;
+    } = {},
   ): Promise<{ verdict: MoveVerdict }> {
     const sub: MoveSubmission = { game_id: gameId, turn_index: turnIndex, move };
     if (opts.commentary !== undefined) sub.commentary = opts.commentary;
+    if (opts.utterance !== undefined) sub.utterance = opts.utterance;
     if (opts.resign) sub.resign = true;
     if (opts.draw_offer) sub.draw_offer = true;
     const body = this.signMoveBody(sub);

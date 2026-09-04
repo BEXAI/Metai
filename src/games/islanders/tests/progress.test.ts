@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { isParseError } from '../../../kernel/types.ts';
 import { parseMove } from '../notation.ts';
-import { isTerminal, legalMoves, pathfinderMoves, type IslMove, type IslState } from '../rules.ts';
+import { isTerminal, legalMoves, pathfinderMoves, type IslMove } from '../rules.ts';
 import { craft, give, mustApply, mustReject, placeCity, placeRoad, placeVillage, seedForRoll } from './helpers.ts';
 
 describe('islanders saga cards', () => {

@@ -16,6 +16,10 @@ const OUT = join(import.meta.dirname, '..', 'docs', 'GAME_PLAY');
 function render(h: Howto): string {
   const seats = h.players.max > h.players.min ? `${h.players.min}–${h.players.max}` : `${h.players.min}`;
   const variants = Object.keys(h.variants as Record<string, unknown>);
+  // Howto.example is null when the engine could not produce an opening example.
+  // The API treats that as never fatal, so the generator must too: every
+  // example-derived block below is omitted rather than crashing the whole run.
+  const ex = h.example;
   const L: string[] = [
     `# How to play ${h.name} on Naibul (agent guide)`,
     '',
@@ -40,12 +44,16 @@ function render(h: Howto): string {
     `POST /api/games/<game_id>/moves        # signed; body below`,
     '```',
     '',
-    'A real submission body for this game (sign it per the playbook, then attach `signature`):',
-    '',
-    '```json',
-    JSON.stringify(h.example.submit_body_example, null, 2),
-    '```',
-    '',
+    ...(ex
+      ? [
+          'A real submission body for this game (sign it per the playbook, then attach `signature`):',
+          '',
+          '```json',
+          JSON.stringify(ex.submit_body_example, null, 2),
+          '```',
+          '',
+        ]
+      : []),
     '## Move notation',
     '',
     ...h.notation.map((n) => `- ${n}`),
@@ -69,21 +77,25 @@ function render(h: Howto): string {
     '',
     h.ending,
     '',
-    '## Worked example — the opening position, straight from the engine',
-    '',
-    `The opening position offers **${h.example.opening_legal_move_count} legal moves**. The first few as they`,
-    'appear in `data.view.legal_moves`:',
-    '',
-    '```json',
-    JSON.stringify(h.example.legal_moves_sample, null, 2),
-    '```',
-    '',
-    'And the board exactly as you receive it in `data.view.board_text`:',
-    '',
-    '```text',
-    h.example.board_text_sample,
-    '```',
-    '',
+    ...(ex
+      ? [
+          '## Worked example — the opening position, straight from the engine',
+          '',
+          `The opening position offers **${ex.opening_legal_move_count} legal moves**. The first few as they`,
+          'appear in `data.view.legal_moves`:',
+          '',
+          '```json',
+          JSON.stringify(ex.legal_moves_sample, null, 2),
+          '```',
+          '',
+          'And the board exactly as you receive it in `data.view.board_text`:',
+          '',
+          '```text',
+          ex.board_text_sample,
+          '```',
+          '',
+        ]
+      : []),
   );
   return L.join('\n');
 }
@@ -94,7 +106,9 @@ for (const game of Object.values(GAMES)) {
   const h = buildHowto(game);
   const file = join(OUT, `${h.game}.md`);
   writeFileSync(file, render(h));
-  written.push(`${h.game}.md (${h.example.opening_legal_move_count} opening moves)`);
+  written.push(
+    `${h.game}.md (${h.example === null ? 'no opening example' : `${h.example.opening_legal_move_count} opening moves`})`,
+  );
 }
 
 // Index page.

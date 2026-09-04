@@ -23,7 +23,7 @@
  *     protocol rather than by play.
  */
 
-import type { Game, GameResult, Json, PlayerId, SeedStream, VariantConfig } from '../../kernel/types.ts';
+import type { Game, GameResult, PlayerId, SeedStream, VariantConfig } from '../../kernel/types.ts';
 import { HISTORY_WINDOW, MAX_SPEECH_CHARS, SEAT_COUNT } from './board.ts';
 import { bindUtterance, parseWwMove, wwMoveSummary, wwMoveToNotation } from './notation.ts';
 import {

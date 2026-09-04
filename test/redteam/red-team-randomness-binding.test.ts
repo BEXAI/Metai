@@ -29,7 +29,7 @@ import { rehashLog } from '../../src/kernel/tests/fixture-game.ts';
 import type { LogEntry, ReplayFile } from '../../src/kernel/replay.ts';
 import { createSeedStream } from '../../src/kernel/seed.ts';
 import { verifyReplay } from '../../src/kernel/verify.ts';
-import type { AnyGame, Json, MoveSubmission } from '../../src/kernel/types.ts';
+import type { AnyGame, MoveSubmission } from '../../src/kernel/types.ts';
 import { RoomCore, type RoomSnapshot } from '../../src/rooms/core.ts';
 import { miniGame, miniGameNoDefault } from '../../src/rooms/tests/mini-game.ts';
 import {

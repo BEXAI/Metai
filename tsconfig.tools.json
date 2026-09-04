@@ -1,0 +1,14 @@
+// The root tsconfig.json only includes src/** and test/**, so the build and
+// tooling scripts were never typechecked — which is how five unguarded
+// `h.example` dereferences survived in scripts/gen-game-play-docs.ts (the type
+// is `HowtoExample | null` and the API documents null as "never fatal").
+//
+// This config extends the root one and adds those files. src/** is included
+// because the scripts import the game registry from it. web/**/*.ts is still
+// excluded: those files need DOM lib types this config does not load.
+//
+// Run with: npm run typecheck:all
+{
+  "extends": "./tsconfig.json",
+  "include": ["src/**/*.ts", "migrations/**/*.ts", "scripts/**/*.ts", "vitest.config.ts"]
+}

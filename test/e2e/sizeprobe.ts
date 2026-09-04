@@ -13,7 +13,7 @@ import { createSeedStream } from '../../src/kernel/seed.ts';
 import { sha256Hex } from '../../src/crypto/canonical.ts';
 import { roundAt } from '../../src/crypto/drand.ts';
 import type { Json, MoveSubmission, VariantConfig, ViewObject } from '../../src/kernel/types.ts';
-import { landlordStrategy, islandersStrategy, randomStrategy, updateFlags, type MatchFlags, type Strategy } from './match.ts';
+import { decisionOf, landlordStrategy, islandersStrategy, randomStrategy, updateFlags, type MatchFlags, type Strategy } from './match.ts';
 
 const gameId = 'probe_1';
 const gameName = process.argv[2] ?? 'landlord';
@@ -60,7 +60,9 @@ while (core.status === 'running' && decisions < 5000) {
     const view = core.viewFor(player, Date.now()) as ViewObject;
     if (view.legal_moves.length === 0) continue;
     const pick = strategy(view, { flags, seed, decision: decisions });
-    const sub: MoveSubmission = { game_id: gameId, turn_index: view.turn_index, move: { index: pick } };
+    const decision = decisionOf(pick);
+    const sub: MoveSubmission = { game_id: gameId, turn_index: view.turn_index, move: decision.move };
+    if (decision.utterance !== undefined) sub.utterance = decision.utterance;
     const msg = moveSignMessage(gameId, sub.turn_index, sub);
     const res = core.submitMove(Date.now(), `a_${seatIx}`, sub, signEd25519(keys[seatIx]!.secretKeyHex, msg));
     if (!res.ok) {

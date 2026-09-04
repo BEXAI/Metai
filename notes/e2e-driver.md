@@ -16,6 +16,15 @@ does all three, and the whole matrix was re-proven against it: **15/15 tests
 green** (fresh-state run), with one precisely-pinned known ratings bug (see
 gap #10).
 
+**UPDATE (2026-09-04): werewolf added — 16/16 green.** The thirteenth game is
+the first whose moves are WORDS, so it needed a driver capability the twelve
+board games never did: a strategy may now return a `MoveDecision`
+(`{ move, utterance?, commentary? }`) instead of a bare legal-move index, and
+`werewolfStrategy` uses it to speak over BOTH channels — inline as a quoted
+JSON string literal in the notation (`accuse(p3) "…"`) and in the separate
+signed `utterance` field. See the werewolf row in the matrix and the werewolf
+quirks below.
+
 ## Run commands
 
 ```bash
@@ -111,6 +120,7 @@ vitest (Node)                              wrangler dev :8788 (fresh state)
 | backgammon | 2 | GREEN | ends by bearoff / gammon-scale scores |
 | landlord | 2 | GREEN | **FULL LENGTH, no resign valve**: variant `{"starting_cash":20000,"turn_limit":150}` → 1239 applied decisions (1160 on the first re-prove run), ends by turn_limit; crosses the old ~780-decision SQLITE_TOOBIG point (retired single-blob snapshot would be ~7 MB, 3.5x the 2 MB DO cap) — chunked storage survives, the ~1 MB replay serves from R2 and passes verifyReplay. 2p not 3p: product pairer always seats players.min (see gap #11). auction + auction_won + trade flags seen (via real game:* events) |
 | islanders | 3 | GREEN | REAL 3-seat pairing (players.min=3); accepted trade + bandit steal; ends by points, ~455-475 decisions, no resign valve |
+| werewolf | 8 | GREEN | REAL 8-seat pairing through the signed lobby door, eight Ed25519 agents, no house backfill. Ends naturally (`wolves` / `village` / `day_limit`) in 2-4 days, ~50-95 decisions, with ZERO timeouts, strikes, forfeits or forced moves — asserted, so the test cannot pass vacuously. Also asserts: every move played in phase `night` notates as the constant `night` (and no night verb ever reaches the spectator feed); commentary is DROPPED on night moves but survives by day; `state_hash` is absent from every live public `move` event yet present on every logged entry (and `final_state_hash` still rides the post-end `end` event); speech arrives over BOTH channels and lands in the transcript, the public `game:speech` feed and — for night words — the private pack/note ledgers that only the replay shows; the result names the WHOLE winning team, dead members included; and a per-event, time-scoped role scan finds no living seat's role anywhere in the pre-end stream while the post-end `reveal` event does publish the full role map |
 | misbehavior (A11) | 2 | GREEN | 2-illegal+legal turns, one full 3-illegal forced turn, one REAL 60 s timeout (default clock, no override); strikes + defaults verified in the log; **verifyReplay now passes ALL checks strictly** — old gap #9 (forced-third-illegal) is fixed |
 
 Every green match asserts: game id matches the real d1GameFactory shape
@@ -198,8 +208,38 @@ Still open (found in this re-prove — NOT fixed here, src/ is out of scope):
   fully-real clock, the product would need a create-time clock hook exposed
   through pairing (per_move_ms/clock_scale exist on the room's /create but
   nothing product-side passes them).
+- **Werewolf: the union leak probe had to be SCOPED.** `collectSecretProbes`
+  unions each game's `secretProbes` over every replayed state and scans the
+  whole pre-end event stream for the result. Werewolf is the one game where a
+  hidden secret becomes LEGITIMATELY public mid-game: every death reveals the
+  dead seat's role, and the public dossier then prints `p3 WEREWOLF` in the
+  `board_text` of every later `move` event — byte-identical to that seat's own
+  dossier-row probe, collected from the earlier states in which it was still
+  alive. Unscoped, the standard scan fails on CORRECT behaviour (measured: 6-10
+  false hits per game). The union is now restricted to seats never revealed at
+  all (nothing in `state.revealed` at the end of play), which still leaves 6-14
+  live probes; the sharper TIME-SCOPED form — per event, against exactly the
+  seats still hidden at that event — lives in the werewolf test itself.
+- **Werewolf: speech channel by SEAT PARITY, not a coin.** Night 1 and both
+  day-1 talk rounds have all eight seats moving, so parity makes both channels
+  certain. A coin would not: night words never reach a public surface, so a run
+  whose coin landed the same way all night would make that half of the
+  assertion silently vacuous instead of failing.
+- **Werewolf: the driver reads `legal_moves[i].move`, not just `.notation`.**
+  Every night entry notates as the redacted constant `night`, which carries no
+  target, so the head for INLINE night speech (`kill(p3) "…"`) is rebuilt from
+  the move object the view ships alongside it. Submitting that is the point:
+  the room must still log `night`.
+- **Werewolf clocks are the game's own.** `phaseBudgetMs` (night 60 s, each
+  talk round 150 s, defence 60 s, ballot 60 s) wins over the e2e
+  `PER_MOVE_MS_OVERRIDE`, so the werewolf match is unaffected by that var.
 - **Suite timings** (Apple Silicon, local; definitive fresh-state run):
   15/15 tests in ~138 s total — every M1+M2 game under 4 s, landlord ~33 s
   (1239 decisions, ~27 ms/decision incl. driver overhead), islanders ~19 s,
   misbehavior ~64 s (real 60 s timeout wait). Avg applied-move round trip
-  ~8-11 ms over HTTP.
+  ~8-11 ms over HTTP. Werewolf adds ~2.5 s (66-80 decisions across 8 seats).
+  Those per-match numbers assume an otherwise idle machine: on a contended
+  box the 120 req/min/IP limiter turns the long trading matches into
+  429/`/e2e/unlimit` retry loops and landlord/islanders inflate by an order
+  of magnitude (measured 1417 s / 543 s while the unit suite ran alongside).
+  The short matches, werewolf included, are unaffected.

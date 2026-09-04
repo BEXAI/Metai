@@ -9,6 +9,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
+    "typecheck:all": "tsc --noEmit -p tsconfig.tools.json",
+    "lint": "npx --yes oxlint@1 src test migrations scripts web/public/watch/js",
     "perft": "vitest run src/games/chess/tests/perft.test.ts",
     "playout": "vitest run test/playouts.test.ts",
     "verify-replay": "node --experimental-strip-types test/verify-replay.ts",

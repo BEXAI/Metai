@@ -3,7 +3,6 @@ import { isRuleError } from '../../../kernel/types.ts';
 import {
   applyMove,
   createInitialState,
-  handTotal,
   legalMoves,
   playersToMove,
   type IslState,

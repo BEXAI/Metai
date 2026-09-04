@@ -23,7 +23,17 @@ import { join } from 'node:path';
 import { createSeedStream } from '../../src/kernel/seed.ts';
 import { sha256Hex } from '../../src/crypto/canonical.ts';
 import { GAMES } from '../../src/games/index.ts';
-import { isParseError, isRuleError, playerId, type AnyGame, type Json, type PlayerId, type SeedStream, type ViewObject } from '../../src/kernel/types.ts';
+import {
+  isRuleError,
+  playerId,
+  type AnyGame,
+  type Json,
+  type LegalMoveEntry,
+  type PlayerId,
+  type SeedStream,
+  type ViewObject,
+} from '../../src/kernel/types.ts';
+import { resolveSubmittedMove } from '../../src/kernel/move.ts';
 import type { LogEntry, ReplayFile } from '../../src/kernel/replay.ts';
 import { LudusApiError, LudusClient, sleep, type MoveVerdict, type Transport } from './client.ts';
 import { OUT_DIR, type Harness } from './harness.ts';
@@ -46,8 +56,29 @@ export interface StrategyCtx {
   decision: number;
 }
 
-/** Returns the index into view.legal_moves to play. */
-export type Strategy = (view: ViewObject, ctx: StrategyCtx) => number;
+/**
+ * A submission a strategy wants made, for the games where an index is not the
+ * whole move: werewolf's WORDS ARE A MOVE PAYLOAD and ride either inline in the
+ * notation (`accuse(p3) "you dodged the check"`) or in the separate `utterance`
+ * field. Every board-game strategy keeps returning a plain index.
+ */
+export interface MoveDecision {
+  move: string | { index: number };
+  utterance?: string;
+  commentary?: string;
+}
+
+/** Returns the index into view.legal_moves to play, or a full submission. */
+export type Strategy = (view: ViewObject, ctx: StrategyCtx) => number | MoveDecision;
+
+/**
+ * Normalise a Strategy's return into submission parts. A bare number is the
+ * index-only form every board game uses; a MoveDecision is what a speech game
+ * returns when it also has words to say.
+ */
+export function decisionOf(pick: number | MoveDecision): MoveDecision {
+  return typeof pick === 'number' ? { move: { index: pick } } : pick;
+}
 
 export const randomStrategy: Strategy = (view, ctx) =>
   ctx.seed.int(`pick:${ctx.decision}`, view.legal_moves.length);
@@ -127,6 +158,173 @@ export const islandersStrategy: Strategy = (view, ctx) => {
     const end = findIdx(view, (n) => n === 'end_turn');
     if (end !== null) return end;
   }
+  return randomStrategy(view, ctx);
+};
+
+// ---------------------------------------------------------------------------
+// werewolf: the one strategy whose moves are WORDS
+// ---------------------------------------------------------------------------
+
+/**
+ * Markers the e2e assertions look for. A move's `text` reaches the state, the
+ * state hash, the signed log and the public transcript, so finding a marker on
+ * the spectator `game:speech` feed proves that CHANNEL carried real words all
+ * the way through — not merely that the field was accepted at the door.
+ */
+export const WW_INLINE_MARK = 'inline-channel';
+export const WW_UTTERANCE_MARK = 'utterance-channel';
+
+/** Deliberately lowercase: an uppercase role word would collide with the
+ *  dossier-row leak probe shape (`p3 SEER`) and fail the scan on our own text. */
+const WW_DAY_LINES: readonly string[] = [
+  'the quiet seats worry me more than the loud ones',
+  'nobody answered the question from the first round',
+  'that timing does not fit an honest seat',
+  'i want the check before i commit to a wagon',
+  'i am reading the vote history, not the volume',
+];
+const WW_NIGHT_LINES: readonly string[] = [
+  'keeping this short, the clock is not generous',
+  'i will follow the wagon tomorrow and watch who flinches',
+  'no need to explain, the count speaks for itself',
+];
+const WW_BALLOT_LINES: readonly string[] = [
+  'voting the seat that drew the accusations',
+  'i would rather be wrong out loud than quiet',
+  'this is the only read i can defend',
+];
+
+/** The move object werewolf ships inside every legal_moves entry. */
+interface WwLegalMoveShape {
+  t?: string;
+  target?: string;
+}
+
+/** The live per-phase speech cap the room shipped (600 day / 300 night / 200 ballot). */
+function wwSpeechCap(view: ViewObject): number {
+  const limit = view.speech?.limit;
+  return typeof limit === 'number' && limit > 0 ? limit : 0;
+}
+
+/** Honours the LIVE cap in view.speech rather than a hardcoded constant. */
+function wwFit(text: string, cap: number): string {
+  return text.length <= cap ? text : text.slice(0, cap).trimEnd();
+}
+
+/**
+ * The notation to hang INLINE speech on. Day and ballot entries already carry
+ * their own head (`accuse(p3)`, `vote(p2)`, `abstain`), but every NIGHT entry
+ * notates as the single redacted constant `night`, which carries no target —
+ * so the night head is rebuilt from the move object the view ships alongside
+ * it. Sending `kill(p3) "…"` is the point: the room must still log `night`.
+ */
+function wwInlineHead(entry: LegalMoveEntry): string {
+  const m = (entry.move ?? {}) as WwLegalMoveShape;
+  switch (m.t) {
+    case 'kill':
+    case 'peek':
+    case 'guard':
+      return `${m.t}(${m.target ?? ''})`;
+    case 'stay_in':
+    case 'sleep':
+      return m.t;
+    default:
+      return entry.notation;
+  }
+}
+
+/**
+ * Submits `entry` WITH WORDS, over one of the two channels the game accepts:
+ *   inline    a quoted JSON string literal in the notation — accuse(p3) "…"
+ *   utterance the separate signed field, folded in by game.bindUtterance
+ * Both land in move.text, so both are phase-gated by apply(), covered by the
+ * state hash and recomputed by the offline verifier.
+ *
+ * The channel is chosen by SEAT PARITY, not by a coin. Night 1, both talk
+ * rounds of day 1 and the day-1 ballot all have every one of the eight seats
+ * moving, so parity makes BOTH channels certain in every one of those phases.
+ * A coin would not: night words never reach a public surface, so a run whose
+ * coin happened to land the same way all night would make that half of the
+ * assertion silently vacuous instead of failing.
+ */
+function wwSpeak(view: ViewObject, entry: LegalMoveEntry, line: string): MoveDecision {
+  const cap = wwSpeechCap(view);
+  if (cap === 0) return { move: { index: entry.index } };
+  if (view.you.seat % 2 === 0) {
+    const text = wwFit(`${WW_INLINE_MARK} ${line}`, cap);
+    return { move: `${wwInlineHead(entry)} ${JSON.stringify(text)}` };
+  }
+  return { move: { index: entry.index }, utterance: wwFit(`${WW_UTTERANCE_MARK} ${line}`, cap) };
+}
+
+/**
+ * Werewolf: PHASE-AWARE, and never a script. The role deal comes from the
+ * room's commit-revealed seed, so which seat may kill, peek or guard differs
+ * every run and is only ever discovered from that seat's own legal_moves.
+ *
+ * night      every living seat must submit; a villager's only option is
+ *            `sleep` (index 0) and skipping it times the seat out. A seat that
+ *            HAS a real action takes it 9 nights in 10, which is what drives
+ *            the game to a natural terminal instead of six silent nights.
+ * day_talk   accuse-heavy, so a most-accused seat exists and the defence phase
+ *            actually runs; claim/report/defend/say fill the rest.
+ * day_vote   pile onto the seat that just defended (read off public.defender,
+ *            which is public information) 7 times in 10 — strict plurality
+ *            lynches and ANY TIE IS NO LYNCH, so a scattered ballot would stall
+ *            the game at the day limit every time.
+ */
+export const werewolfStrategy: Strategy = (view, ctx) => {
+  const legal = view.legal_moves;
+  if (legal.length === 0) return 0;
+  const pick = (list: LegalMoveEntry[], key: string): LegalMoveEntry =>
+    list[ctx.seed.int(`ww:${key}:${ctx.decision}`, list.length)]!;
+  const lineFrom = (lines: readonly string[], key: string): string =>
+    lines[ctx.seed.int(`ww:${key}:${ctx.decision}`, lines.length)]!;
+
+  if (view.phase === 'night') {
+    const acts = legal.filter((m) => {
+      const t = (m.move as WwLegalMoveShape | undefined)?.t;
+      return t === 'kill' || t === 'peek' || t === 'guard';
+    });
+    const entry =
+      acts.length > 0 && ctx.seed.int(`ww:act:${ctx.decision}`, 10) < 9 ? pick(acts, 'nightact') : legal[0]!;
+    // Night words are a pack whisper (wolves) or a private note (everyone
+    // else): they reach no public surface, so the only place they can be
+    // proved to have landed is the replay.
+    return wwSpeak(view, entry, lineFrom(WW_NIGHT_LINES, 'nightline'));
+  }
+
+  if (view.phase === 'day_talk' || view.phase === 'day_defense') {
+    const of = (prefix: string): LegalMoveEntry[] => legal.filter((m) => m.notation.startsWith(prefix));
+    const accuse = of('accuse(');
+    const report = of('report(');
+    const claim = of('claim(');
+    const defend = of('defend(');
+    const roll = ctx.seed.int(`ww:day:${ctx.decision}`, 10);
+    let entry: LegalMoveEntry;
+    if (roll < 5 && accuse.length > 0) entry = pick(accuse, 'accusepick');
+    else if (roll < 7 && report.length > 0) entry = pick(report, 'reportpick');
+    else if (roll < 8 && claim.length > 0) entry = pick(claim, 'claimpick');
+    else if (roll < 9 && defend.length > 0) entry = pick(defend, 'defendpick');
+    else entry = legal[0]!; // `say`
+    // Speech IS the day move here: silence is index 0 with text ''.
+    return wwSpeak(view, entry, lineFrom(WW_DAY_LINES, 'dayline'));
+  }
+
+  if (view.phase === 'day_vote') {
+    const votes = legal.filter((m) => m.notation.startsWith('vote('));
+    const pub = view.public as { defender?: unknown } | null;
+    const defender = typeof pub?.defender === 'string' ? pub.defender : null;
+    const wagon = defender === null ? [] : votes.filter((m) => m.notation === `vote(${defender})`);
+    const entry =
+      wagon.length > 0 && ctx.seed.int(`ww:wagon:${ctx.decision}`, 10) < 7
+        ? wagon[0]!
+        : votes.length > 0
+          ? pick(votes, 'votepick')
+          : legal[0]!; // `abstain`
+    return wwSpeak(view, entry, lineFrom(WW_BALLOT_LINES, 'ballotline'));
+  }
+
   return randomStrategy(view, ctx);
 };
 
@@ -425,7 +623,12 @@ export async function runMatch(h: Harness, opts: MatchOptions): Promise<MatchRep
       const t0 = Date.now();
       let verdict: MoveVerdict;
       try {
-        const out = await c.move(gameId, view.turn_index, { index: pick }, { commentary, transport: transports[ix] });
+        const decision = decisionOf(pick);
+        const out = await c.move(gameId, view.turn_index, decision.move, {
+          commentary: decision.commentary ?? commentary,
+          utterance: decision.utterance,
+          transport: transports[ix],
+        });
         verdict = out.verdict;
       } catch (e) {
         if (e instanceof LudusApiError) {
@@ -668,38 +871,114 @@ function hash8(s: string): number {
 // ---------------------------------------------------------------------------
 
 /**
- * Recomputes the state after every applied entry by replaying the log with
- * the game module and a fresh seed stream from final_seed (purpose-scoped
- * HMAC streams mean skipping the verifier-only pick draws cannot desync the
- * game's own draw purposes). Returns [initialState, ...stateAfterEachApply].
+ * Recomputes the state after every state-changing entry by replaying the log
+ * with the game module and a fresh seed stream from final_seed. Returns
+ * [initialState, ...stateAfterEachApply].
+ *
+ * THE MOVE COMES FROM `payload.submission`, NOT FROM THE LOGGED NOTATION.
+ * This mirrors kernel/verify.ts's recomputation exactly, and it has to: a game
+ * may REDACT its notation, and werewolf does — every night move of every role
+ * notates as the single token `night`, so re-parsing the notation would replay
+ * every night as an abstention and diverge on the first kill. Resolving the
+ * submission through the shared kernel/move.ts ladder also picks up
+ * bindUtterance, so speech lands in the state here the same way it did in the
+ * room. The three non-submission paths are reproduced the way the room and the
+ * verifier both freeze them:
+ *
+ *   timeout            game.defaultMove, else legal[seed.int('timeout:turn:N')]
+ *   forced: 'illegal'  legal[seed.int('illegal:turn:N')] — the SUBMISSION on
+ *                      such an entry is the rejected third attempt, not the
+ *                      move that applied
+ *   forfeit + state_hash   an ELIMINATION: game.forfeitPlayer advanced the
+ *                      state, and everything after it depends on that
+ *
+ * Purpose-scoped HMAC streams mean the draws taken here for the forced paths
+ * can never desync the game's own draw purposes.
  */
+/** One state-changing log entry, with the states either side of it. */
+export interface ReplayStep {
+  entry: LogEntry;
+  /** The state the entry was applied TO (so: the phase it was played in). */
+  pre: Json;
+  /** The state it produced. */
+  post: Json;
+}
+
+export interface ReplayWalk {
+  initial: Json;
+  steps: ReplayStep[];
+}
+
 export function replayStates(replay: ReplayFile): Json[] {
+  const walk = replayWalk(replay);
+  return [walk.initial, ...walk.steps.map((s) => s.post)];
+}
+
+/**
+ * The walk replayStates is built on, exposed because some assertions need the
+ * PRE state of an entry and not just the sequence of states: werewolf's night
+ * redaction is a claim about the phase a move was PLAYED IN, and only `pre`
+ * says what that was (the last night mover's own move lands in day_talk).
+ */
+export function replayWalk(replay: ReplayFile): ReplayWalk {
   const game = GAMES[replay.game] as AnyGame | undefined;
   if (!game) throw new Error(`replayStates: unknown game '${replay.game}'`);
   const seed = createSeedStream(replay.final_seed);
   const players = replay.seats.map((_, i) => playerId(i));
   let state = game.initialState(seed, players, replay.variant);
-  const states: Json[] = [state];
-  for (const entry of replay.log) {
-    const applied = appliedNotationOf(entry);
-    if (applied === null) continue;
-    const payload = entry.payload as { player?: PlayerId };
-    const player = payload.player ?? '';
-    const move = game.parseMove(applied, state, player);
-    if (isParseError(move)) throw new Error(`replayStates seq ${entry.seq}: cannot parse '${applied}': ${move.message}`);
-    const out = game.apply(state, player, move, seed);
-    if (isRuleError(out)) throw new Error(`replayStates seq ${entry.seq}: apply('${applied}') rejected: ${out.message}`);
-    state = out.state;
-    states.push(state);
-  }
-  return states;
-}
+  const initial = state;
+  const steps: ReplayStep[] = [];
 
-function appliedNotationOf(entry: LogEntry): string | null {
-  const payload = entry.payload as { notation?: string; applied_notation?: string };
-  if (entry.kind === 'move') return typeof payload.notation === 'string' ? payload.notation : null;
-  if (entry.kind === 'timeout') return typeof payload.applied_notation === 'string' ? payload.applied_notation : null;
-  return null;
+  for (const entry of replay.log) {
+    if (entry.kind !== 'move' && entry.kind !== 'timeout' && entry.kind !== 'forfeit') continue;
+    const payload = entry.payload as {
+      player?: PlayerId;
+      turn_index?: number;
+      forced?: string;
+      state_hash?: string;
+      submission?: { move?: unknown; utterance?: unknown };
+    };
+    const player = payload.player ?? '';
+    const where = `replayStates seq ${entry.seq} (${entry.kind} ${player})`;
+
+    if (entry.kind === 'forfeit') {
+      // { player, reason } with no state_hash is the TERMINAL forfeit every
+      // game without forfeitPlayer produces: nothing follows it and the state
+      // is unchanged.
+      if (payload.state_hash === undefined) continue;
+      const out = game.forfeitPlayer?.(state, player) ?? null;
+      if (out === null) throw new Error(`${where}: forfeitPlayer returned null for a logged elimination`);
+      steps.push({ entry, pre: state, post: out.state });
+      state = out.state;
+      continue;
+    }
+
+    const turn = typeof payload.turn_index === 'number' ? payload.turn_index : 0;
+    let move: Json;
+    if (entry.kind === 'timeout' || payload.forced === 'illegal') {
+      const legal = game.legalMoves(state, player);
+      if (legal.length === 0) throw new Error(`${where}: forced entry but no legal moves exist`);
+      if (entry.kind === 'timeout') {
+        move = game.defaultMove
+          ? game.defaultMove(state, player, legal)
+          : legal[seed.int(`timeout:turn:${turn}`, legal.length)]!;
+      } else {
+        move = legal[seed.int(`illegal:turn:${turn}`, legal.length)]!;
+      }
+    } else {
+      const submission = payload.submission;
+      if (typeof submission !== 'object' || submission === null) throw new Error(`${where}: payload.submission missing`);
+      const resolved = resolveSubmittedMove(game, state, player, submission as { move: unknown; utterance?: unknown });
+      if (!resolved.ok) throw new Error(`${where}: submission did not resolve (${resolved.reason})`);
+      move = resolved.move;
+    }
+
+    const out = game.apply(state, player, move, seed);
+    if (isRuleError(out)) throw new Error(`${where}: apply rejected the replayed move: ${out.code}: ${out.message}`);
+    steps.push({ entry, pre: state, post: out.state });
+    state = out.state;
+  }
+  return { initial, steps };
 }
 
 /**
@@ -715,12 +994,44 @@ export async function collectSecretProbes(replay: ReplayFile): Promise<string[]>
     const mod = await import('../../src/games/islanders/index.ts');
     probesFn = (state: Json, player: PlayerId) =>
       (mod.secretProbes as (s: unknown, p: PlayerId) => string[])(state, player);
+  } else if (replay.game === 'werewolf') {
+    // Every probe werewolf emits clears the 6-char filter below: the shortest
+    // family is the dossier row `p0 SEER` at 7. A terminal state contributes
+    // nothing (the post-`end` reveal is sanctioned), which is exactly why the
+    // e2e scan is over PRE-END events.
+    const mod = await import('../../src/games/werewolf/index.ts');
+    probesFn = (state: Json, player: PlayerId) =>
+      (mod.secretProbes as (s: unknown, p: PlayerId) => string[])(state, player);
   }
   if (!probesFn) return [];
-  const probes = new Set<string>();
+  const states = replayStates(replay);
   const players = replay.seats.map((_, i) => playerId(i));
-  for (const state of replayStates(replay)) {
+
+  /**
+   * Which seats a UNION-over-all-states probe set may speak for.
+   *
+   * Werewolf is the one game where a hidden secret becomes LEGITIMATELY public
+   * mid-game: every death reveals the dead seat's role, and the public dossier
+   * then prints `p3 WEREWOLF` in the board_text of every later move event —
+   * which is byte-identical to that seat's own dossier-row probe, collected
+   * from the earlier states in which it was still alive. Scanning the union
+   * against the whole pre-end stream would therefore fail on CORRECT
+   * behaviour. The union is restricted to seats whose role never became public
+   * at all (nothing in `revealed` at the end of play), and the sharper,
+   * time-scoped check — a per-event scan against exactly the seats still
+   * hidden AT THAT EVENT — lives in the werewolf match test.
+   */
+  let speaksFor: (p: PlayerId) => boolean = () => true;
+  if (replay.game === 'werewolf') {
+    const final = states[states.length - 1] as { revealed?: Record<string, unknown> } | null;
+    const revealed = new Set(Object.keys(final?.revealed ?? {}));
+    speaksFor = (p) => !revealed.has(p);
+  }
+
+  const probes = new Set<string>();
+  for (const state of states) {
     for (const p of players) {
+      if (!speaksFor(p)) continue;
       for (const probe of probesFn(state, p)) {
         if (probe.length >= 6) probes.add(probe);
       }

@@ -1,7 +1,7 @@
 /**
  * E2E harness: boots the REAL local Worker (wrangler dev) against a FRESH
- * per-run state directory, applies schema.sql to local D1, ticks the cron,
- * and tears down cleanly.
+ * per-run state directory, applies the full schema (schema.sql + every
+ * migration, in order) to local D1, ticks the cron, and tears down cleanly.
  *
  * Fresh state: every run gets test/e2e/out/state-<runid>/ passed as
  * --persist-to, so runs never share D1/DO/KV/R2 state. Artifacts (wrangler
@@ -18,6 +18,7 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createWriteStream, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { schemaFiles } from '../../migrations/apply.ts';
 import { generateKeypair } from '../../src/crypto/ed25519.ts';
 import { sleep } from './client.ts';
 
@@ -55,14 +56,18 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
   mkdirSync(stateDir, { recursive: true });
   const logFile = join(OUT_DIR, `wrangler-${runId}.log`);
 
-  // 1. Fresh local D1 schema (same persist dir the dev server will use).
-  const schema = spawnSync(
-    WRANGLER_BIN,
-    ['d1', 'execute', 'DB', '--local', `--file=${join(REPO_ROOT, 'schema.sql')}`, '--persist-to', stateDir, '--config', CONFIG_PATH],
-    { cwd: REPO_ROOT, encoding: 'utf8', timeout: 120_000 },
-  );
-  if (schema.status !== 0) {
-    throw new Error(`schema apply failed (${schema.status}):\n${schema.stdout}\n${schema.stderr}`);
+  // 1. Fresh local D1 schema (same persist dir the dev server will use):
+  //    schema.sql (migration 0001) and then every later migration, in order.
+  //    The state dir is new every run, so the whole list always applies.
+  for (const file of schemaFiles()) {
+    const schema = spawnSync(
+      WRANGLER_BIN,
+      ['d1', 'execute', 'DB', '--local', `--file=${file}`, '--persist-to', stateDir, '--config', CONFIG_PATH],
+      { cwd: REPO_ROOT, encoding: 'utf8', timeout: 120_000 },
+    );
+    if (schema.status !== 0) {
+      throw new Error(`schema apply failed for ${file} (${schema.status}):\n${schema.stdout}\n${schema.stderr}`);
+    }
   }
 
   // 2. Spawn wrangler dev with the shim config.

@@ -23,7 +23,6 @@ import {
   type AnyGame,
   type Json,
   type MoveSubmission,
-  type PlayerId,
   type VariantConfig,
   type ViewObject,
 } from '../../src/kernel/types.ts';

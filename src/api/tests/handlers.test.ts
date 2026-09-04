@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import { NO_KEY_SENTENCE } from '../../doc.ts';
 import { handleApiRequest } from '../router.ts';
-import { insertGame, makeTestEnv, type TestEnv } from './fakes.ts';
+import { insertGame, makeTestEnv } from './fakes.ts';
 import { apiRequest, envelope, insertAgent, signedHeaders, type TestAgent } from './helpers.ts';
 
 function seat(agent: TestAgent, player = 'p0'): { player: string; agent_id: string; handle: string; pubkey_ed25519: string } {

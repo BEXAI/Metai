@@ -22,7 +22,6 @@ import type {
   SeedStream,
   VariantConfig,
 } from '../../kernel/types.ts';
-import { playerId } from '../../kernel/types.ts';
 
 // ---------------------------------------------------------------------------
 // Resources, terrain, cards, costs

@@ -16,7 +16,6 @@ import { clear } from '../dom.js';
 
 const LAND_LETTERS = [...'ABCDEFGHIJKLMNOPQRS'];
 const SEA_LETTERS = [...'abcdefghijklmnopqr'];
-const DIRS = [[1, 0], [1, -1], [0, -1], [-1, 0], [-1, 1], [0, 1]];
 const SIZE = 34;
 
 function buildCoords() {

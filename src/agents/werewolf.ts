@@ -319,9 +319,9 @@ const FRAMES = {
   ],
   say: [
     (a: number, w: number) => `${a} of us left, ${w} wolves among them. I am waiting for a claim or a check; speeches do not move me.`,
-    (a: number, w: number) => `No structural read yet with ${a} alive. I will follow the ledger, not the loudest seat.`,
+    (a: number, _w: number) => `No structural read yet with ${a} alive. I will follow the ledger, not the loudest seat.`,
     (a: number, w: number) => `${w} wolves, ${a} seats. Somebody with information should spend it before the next night.`,
-    (a: number, w: number) => `Holding. Nothing in the record separates the ${a} of us yet. Give me a check to work with.`,
+    (a: number, _w: number) => `Holding. Nothing in the record separates the ${a} of us yet. Give me a check to work with.`,
   ],
   hold: [
     () => `No check and no vote pattern points anywhere yet, so I am not casting a vote I cannot defend.`,

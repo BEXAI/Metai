@@ -36,8 +36,12 @@ import {
   collectSecretProbes,
   islandersStrategy,
   landlordStrategy,
+  replayWalk,
   runMatch,
   runMisbehaviorMatch,
+  werewolfStrategy,
+  WW_INLINE_MARK,
+  WW_UTTERANCE_MARK,
   type MatchReport,
   type Strategy,
 } from './match.ts';
@@ -286,6 +290,285 @@ describe('stage-4 e2e: hidden-information trading games', () => {
       const stealOrBankruptcy = report!.flags.steal || landlordFlags?.bankruptcy === true;
       expect(tradeSomewhere, 'at least one accepted trade across the trading matches').toBe(true);
       expect(stealOrBankruptcy, 'at least one bandit steal or bankruptcy across the trading matches').toBe(true);
+    },
+  );
+});
+
+describe('stage-4 e2e: werewolf — eight seats, hidden roles, words as moves', () => {
+  it(
+    'werewolf: 8-seat match through the real signed door; replay verifies, roles never leak pre-end, speech rides BOTH channels',
+    { timeout: 1_200_000 },
+    async () => {
+      // The whole seat configuration is meta.players, and the product pairer
+      // seats players.min: if this ever became a range the "8-seat match"
+      // below would silently become something else.
+      expect(GAMES['werewolf']!.meta.players).toEqual({ min: 8, max: 8 });
+
+      const report = await runMatch(h, {
+        game: 'werewolf',
+        players: 8,
+        // A full-length game is 6 days x 33 rows; 600 is a safety cap only.
+        maxDecisions: 600,
+        label: 'werewolf',
+        strategies: Array.from({ length: 8 }, () => werewolfStrategy),
+        // Also exercises the commentary gate: `commentary` is a PUBLIC aside,
+        // so the room DROPS it in a phase whose speech audience is not the
+        // village — otherwise a wolf narrating its kill would publish the pack
+        // straight through the `night` redaction.
+        commentaryEvery: 3,
+      });
+
+      // Everything the other matches assert: R2 replay, log ordering, FULL
+      // offline verifyReplay, one agreed result, ratings, and the generic
+      // pre-end secret-probe scan.
+      await assertMatch(report);
+
+      const replay = report.replay;
+      const seats = replay.seats.map((s) => s.player);
+      expect(seats).toHaveLength(8);
+      expect(new Set(replay.seats.map((s) => s.handle)).size, 'eight distinct agents').toBe(8);
+      for (const s of replay.seats) expect(s.pubkey_ed25519).toMatch(/^[0-9a-f]{64}$/);
+
+      const walk = replayWalk(replay);
+      const finalState = (walk.steps.length > 0 ? walk.steps[walk.steps.length - 1]!.post : walk.initial) as {
+        alive?: Record<string, boolean>;
+        cause?: Record<string, string>;
+        packLog?: { text: string }[];
+        noteLog?: { text: string }[];
+      };
+      const alive = finalState.alive ?? {};
+
+      // The DAY mechanic actually resolved at least once. Without this the
+      // match could satisfy everything else while only the wolves ever ate:
+      // strict plurality with ANY TIE IS NO LYNCH means a strategy that
+      // scattered its ballot would silently stop exercising the lynch path,
+      // and a 'wolves' result would still look like a clean game.
+      const causes = Object.values(finalState.cause ?? {});
+      expect(causes, 'the day vote must have lynched somebody at least once').toContain('lynch');
+
+      const endSeq = report.allEvents.find((e) => e.type === 'end')!.seq;
+      const preEnd = report.allEvents.filter((e) => e.seq < endSeq);
+      const moveEvents = report.allEvents.filter((e) => e.type === 'move');
+      const preEndMoveEvents = preEnd.filter((e) => e.type === 'move');
+      const moveEntries = replay.log.filter((e) => e.kind === 'move');
+      const kinds = replay.log.map((e) => e.kind);
+
+      // ----------------------------------------------------------------------
+      // 1. The game genuinely REACHED a natural terminal result — it was not
+      //    carried there by the clock, by strikes, or by the driver's cap.
+      // ----------------------------------------------------------------------
+      const result = replay.result as {
+        winners: string[];
+        draw: boolean;
+        reason: string;
+        teams: Record<string, string>;
+      };
+      expect(['village', 'wolves', 'day_limit'], `unexpected end reason ${result.reason}`).toContain(result.reason);
+      expect(result.draw).toBe(false);
+      expect(kinds.filter((k) => k === 'timeout'), 'no seat may have been carried by the clock').toHaveLength(0);
+      expect(kinds.filter((k) => k === 'strike'), 'no seat may have been struck').toHaveLength(0);
+      expect(kinds.filter((k) => k === 'forfeit'), 'no seat may have been forfeited').toHaveLength(0);
+      // resign and draw_offer are DISABLED here: neither may appear at all.
+      expect(kinds.filter((k) => k === 'resign' || k === 'draw_offer' || k === 'draw_accept')).toHaveLength(0);
+      for (const entry of moveEntries) {
+        expect((entry.payload as { forced?: unknown }).forced, 'no move may have been forced by the room').toBeUndefined();
+      }
+      // At least one complete cycle at eight seats (8 night + 8 + 8 talk +
+      // defence + 8 ballots), so none of the phase assertions below is vacuous.
+      expect(moveEntries.length, 'the match must cover a whole night/day cycle').toBeGreaterThanOrEqual(33);
+
+      // ----------------------------------------------------------------------
+      // 2. The result names a whole TEAM, dead members included — not a seat.
+      // ----------------------------------------------------------------------
+      expect(Object.keys(result.teams).sort()).toEqual([...seats].sort());
+      const wolves = seats.filter((p) => result.teams[p] === 'wolves').sort();
+      const village = seats.filter((p) => result.teams[p] === 'village').sort();
+      expect(wolves, 'the deal is exactly 2 werewolves').toHaveLength(2);
+      expect(village, 'the deal is exactly 6 non-wolves').toHaveLength(6);
+      const winningTeam = result.reason === 'village' ? village : wolves;
+      expect([...result.winners].sort(), 'winners must be the whole winning team').toEqual(winningTeam);
+      expect(result.winners.length).toBeGreaterThan(1);
+      const losers = seats.filter((p) => !result.winners.includes(p));
+      if (result.reason === 'village') {
+        // The village wins with its night-killed members still on the sheet.
+        expect(
+          result.winners.filter((p) => alive[p] !== true).length,
+          'a village win must crown the seats the wolves already ate',
+        ).toBeGreaterThan(0);
+      } else {
+        // Wolves win at parity or at the day limit with villagers still alive:
+        // surviving is not winning, being on the team is.
+        expect(
+          losers.some((p) => alive[p] === true),
+          'a wolf win leaves living villagers on the losing side',
+        ).toBe(true);
+      }
+
+      // ----------------------------------------------------------------------
+      // 3. THE NIGHT REDACTION. Every move played in phase `night` — kill,
+      //    peek, guard, sleep, stay_in, any target, any words — notates as the
+      //    single constant token, in the log and on the public feed alike.
+      // ----------------------------------------------------------------------
+      let nightMoves = 0;
+      for (const step of walk.steps) {
+        if (step.entry.kind !== 'move') continue;
+        const payload = step.entry.payload as { notation?: string; player?: string };
+        if ((step.pre as { phase?: string }).phase !== 'night') {
+          expect(payload.notation, 'only a night move may notate as `night`').not.toBe('night');
+          continue;
+        }
+        nightMoves++;
+        expect(
+          payload.notation,
+          `${payload.player}'s night move leaked its verb: ${payload.notation}`,
+        ).toBe('night');
+      }
+      expect(nightMoves, 'every living seat acts every night').toBeGreaterThanOrEqual(8);
+      for (const ev of preEndMoveEvents) {
+        const notation = String((ev.data as { notation?: unknown }).notation ?? '');
+        expect(
+          /^(kill|peek|guard|sleep|stay_in)\b/.test(notation),
+          `a night verb reached the spectator feed: ${notation}`,
+        ).toBe(false);
+        // A `commentary` next to a `night` notation would publish the action
+        // the redaction just hid — for the mover's partner as well as itself.
+        if (notation === 'night') {
+          expect(
+            (ev.data as { commentary?: unknown }).commentary,
+            'commentary must be dropped on a night move',
+          ).toBeUndefined();
+        }
+      }
+      expect(
+        moveEvents.some((e) => typeof (e.data as { commentary?: unknown }).commentary === 'string'),
+        'day commentary must survive, or the night-drop check above proves nothing',
+      ).toBe(true);
+
+      // ----------------------------------------------------------------------
+      // 4. state_hash: WITHHELD from the live public feed (the role space is
+      //    840 deals, so a live digest of the full state is brute-forceable),
+      //    but still logged on every entry for the offline verifier.
+      // ----------------------------------------------------------------------
+      for (const ev of [...report.allEvents, ...report.liveEvents]) {
+        if (ev.type !== 'move' && ev.type !== 'timeout') continue;
+        expect(
+          (ev.data as { state_hash?: unknown }).state_hash,
+          `werewolf must not publish state_hash on a live ${ev.type} event`,
+        ).toBeUndefined();
+      }
+      for (const entry of moveEntries) {
+        expect((entry.payload as { state_hash?: unknown }).state_hash).toMatch(/^[0-9a-f]{64}$/);
+      }
+      // The withholding is scoped, not a blanket removal: the post-end `end`
+      // event still publishes the final hash.
+      expect(
+        (report.allEvents.find((e) => e.type === 'end')!.data as { final_state_hash?: unknown }).final_state_hash,
+      ).toMatch(/^[0-9a-f]{64}$/);
+
+      // ----------------------------------------------------------------------
+      // 5. WORDS ARE MOVES, over BOTH channels: inline as a quoted JSON string
+      //    literal in the notation, and in the separate signed `utterance`
+      //    field that bindUtterance folds into the move object.
+      // ----------------------------------------------------------------------
+      const subOf = (e: (typeof moveEntries)[number]): { move?: unknown; utterance?: unknown } =>
+        ((e.payload as { submission?: { move?: unknown; utterance?: unknown } }).submission ?? {});
+      const inlineEntries = moveEntries.filter((e) => {
+        const m = subOf(e).move;
+        return typeof m === 'string' && m.includes(WW_INLINE_MARK);
+      });
+      const utteranceEntries = moveEntries.filter((e) => {
+        const u = subOf(e).utterance;
+        return typeof u === 'string' && u.includes(WW_UTTERANCE_MARK);
+      });
+      expect(inlineEntries.length, 'some moves must carry inline quoted speech').toBeGreaterThan(0);
+      expect(utteranceEntries.length, 'some moves must use the separate utterance field').toBeGreaterThan(0);
+      const notationOf = (e: (typeof moveEntries)[number]): string =>
+        String((e.payload as { notation?: unknown }).notation ?? '');
+      expect(
+        inlineEntries.some((e) => notationOf(e).includes(WW_INLINE_MARK)),
+        'inline speech must survive into the recorded day notation',
+      ).toBe(true);
+      expect(
+        utteranceEntries.some((e) => notationOf(e).includes(WW_UTTERANCE_MARK)),
+        'bindUtterance must fold the separate field into the move itself',
+      ).toBe(true);
+
+      // The words are in the STATE (and therefore in the state hash that
+      // verifyReplay already recomputed), not merely in the submission.
+      const transcriptTexts = new Set<string>();
+      for (const state of [walk.initial, ...walk.steps.map((s) => s.post)]) {
+        for (const u of (state as { transcript?: { text?: string }[] }).transcript ?? []) {
+          if (typeof u.text === 'string' && u.text !== '') transcriptTexts.add(u.text);
+        }
+      }
+      const spoken = [...transcriptTexts];
+      expect(spoken.some((t) => t.includes(WW_INLINE_MARK)), 'inline speech reached the transcript').toBe(true);
+      expect(spoken.some((t) => t.includes(WW_UTTERANCE_MARK)), 'utterance speech reached the transcript').toBe(true);
+
+      // …and the day transcript is genuinely public: it reaches spectators.
+      const feedSpeech = report.allEvents
+        .filter((e) => e.type === 'game:speech')
+        .map((e) => String((e.data as { data?: { text?: unknown } }).data?.text ?? ''));
+      expect(feedSpeech.some((t) => t.includes(WW_INLINE_MARK))).toBe(true);
+      expect(feedSpeech.some((t) => t.includes(WW_UTTERANCE_MARK))).toBe(true);
+
+      // NIGHT words go the other way: both channels land in the private pack /
+      // note ledgers, which only the post-end replay ever shows.
+      const nightTexts = [
+        ...(finalState.packLog ?? []).map((x) => x.text),
+        ...(finalState.noteLog ?? []).map((x) => x.text),
+      ];
+      expect(nightTexts.some((t) => t.includes(WW_INLINE_MARK)), 'inline night speech was recorded').toBe(true);
+      expect(nightTexts.some((t) => t.includes(WW_UTTERANCE_MARK)), 'utterance night speech was recorded').toBe(true);
+      const preEndBlob = preEnd.map((e) => JSON.stringify(e)).join('\n');
+      for (const text of nightTexts) {
+        expect(preEndBlob.includes(text), `night words reached the spectator feed: ${text}`).toBe(false);
+      }
+
+      // ----------------------------------------------------------------------
+      // 6. NO PRE-END LEAK. assertMatch already ran the union probe scan; this
+      //    is the sharper, TIME-SCOPED form: for every pre-end event, no seat
+      //    whose role is still hidden AT THAT POINT may appear with its role in
+      //    any of the three encodings werewolf's own secretProbes pins. (A seat
+      //    that has already died is excluded, because every death legitimately
+      //    reveals — which is exactly why the union form has to be scoped.)
+      // ----------------------------------------------------------------------
+      const probes = await collectSecretProbes(replay);
+      expect(probes.length, 'the leak scan must not be vacuous').toBeGreaterThan(0);
+
+      const revealEntry = replay.log.find((e) => e.kind === 'reveal')!;
+      const roles = (revealEntry.payload as { roles?: Record<string, string> }).roles!;
+      expect(Object.keys(roles).sort()).toEqual([...seats].sort());
+
+      const revealedByNow = new Set<string>();
+      for (const ev of preEnd) {
+        const pub = (ev.data as { public?: { dead?: { seat: string; role: string | null }[] } } | null)?.public;
+        for (const d of pub?.dead ?? []) if (d.role !== null) revealedByNow.add(d.seat);
+        const blob = JSON.stringify(ev);
+        for (const seat of seats) {
+          if (revealedByNow.has(seat)) continue;
+          const role = roles[seat]!;
+          for (const probe of [`"${seat}":"${role}"`, `"seat":"${seat}","role":"${role}"`, `${seat} ${role.toUpperCase()}`]) {
+            expect(
+              blob.includes(probe),
+              `pre-end ${ev.type} event #${ev.seq} leaked living seat ${seat}: ${probe}`,
+            ).toBe(false);
+          }
+        }
+      }
+      expect(revealedByNow.size, 'seats died during the match, so the scan tracked real reveals').toBeGreaterThan(0);
+
+      // The roles ARE published — after `end`, on the reveal event. Without
+      // this the absence above could just mean nobody ever computed them.
+      const revealEv = report.allEvents.find((e) => e.type === 'reveal')!;
+      expect(revealEv.seq).toBeGreaterThan(endSeq);
+      expect((revealEv.data as { roles?: unknown }).roles).toEqual(roles);
+
+      console.log(
+        `[e2e] werewolf: ${report.decisions} decisions, result=${JSON.stringify(replay.result)}, ` +
+          `night moves=${nightMoves}, inline=${inlineEntries.length}, utterance=${utteranceEntries.length}, ` +
+          `replay=${report.replayPath}`,
+      );
     },
   );
 });

@@ -12,7 +12,7 @@
 import { describe, expect, it } from 'vitest';
 import { hashJson, sha256Hex } from '../../src/crypto/canonical.ts';
 import { signEd25519, verifyEd25519 } from '../../src/crypto/ed25519.ts';
-import { publicKeyOf, sign } from '../../src/identity/ed25519.ts';
+import { publicKeyOf } from '../../src/identity/ed25519.ts';
 import { MOVE_SIGN_PREFIX } from '../../src/kernel/replay.ts';
 import { playerId, type Json, type MoveSubmission, type VariantConfig } from '../../src/kernel/types.ts';
 import { moveSignMessage, RoomCore, type RoomSeat, type SubmitOk, type SubmitReject } from '../../src/rooms/core.ts';
@@ -131,7 +131,6 @@ describe('replay of a signed move', () => {
   it('rejects a signed resignation replayed on a later turn', () => {
     const { core, seats } = makeCore('resign-replay');
     const p0 = seats[0]!;
-    const p1 = seats[1]!;
 
     // Capture a resignation signed for turn 0, but do NOT submit it yet.
     const capturedResign = signedSub('resign-replay', p0, 0, { index: 0 }, { resign: true });
