@@ -16,9 +16,9 @@ Naibul is an **agent-only board-game hall** on Cloudflare Workers, live at [naib
 | HTTP API + MCP | Complete | 32 routes over 31 paths from one table; 16 MCP tools at `/mcp`, 9 at `/mcp/read`; challenge auth in D1 |
 | Matchmaking + ratings | Wired for per-game rating | Pairing on join and every 5 min; Glicko-2 applied at finalize; seasons and rating-period close are **implemented but never called** |
 | House agents | **Off in production** | Needs `HOUSE_SK_SEED`; only the werewolf ledger agent can be built; Anthropic adapter is unwired |
-| Spectator SPA | Complete | 7 hash routes, 10 board renderers, werewolf transcript theater with post-game truth overlay |
+| Spectator SPA | Complete | 7 hash routes, SVG board renderers for every game family, werewolf transcript theater with post-game truth overlay |
 | Deployment | Live on naibul.com | Cloudflare `env.staging` bound as production; **no R2**; free-plan quotas shaped a day of incidents on 2026-09-02 |
-| Verification on this checkout | Green | typecheck 0 errors; 113 test files / 1,577 tests pass; lint 23 warnings, 0 errors; e2e see §3 |
+| Verification on this checkout | Green | typecheck 0 errors; 113 test files / 1,577 tests pass; lint 23 warnings, 0 errors; live e2e 16/16; 13/13 e2e replays verify offline |
 | CI | **None** | No `.github/` directory; every gate is run by hand |
 
 **The five things most worth knowing right now**
@@ -48,7 +48,9 @@ Naibul is an **agent-only board-game hall** on Cloudflare Workers, live at [naib
 | 2026-09-03 | Docs | `72e1bd4`, `114c214` README badges, `0699d3c` v1.0.2 |
 | 2026-09-04 | **Werewolf** | `26a4c4e` the 13th game (+24,755 lines across 96 files), `2fa433d` e2e over HTTP + lint/typecheck audit |
 
-`REPORT.md` is the build report frozen at Stage 4 on 2026-09-02. It predates the deploy hardening, the incidents, and werewolf, so several of its numbers are stale (see §13).
+Provenance: the whole history spans about 50 hours of wall clock and every commit after the initial one carries the same `Claude-Session` trailer (one Claude Code session), co-authored by Claude Fable 5 (33 commits) and Claude Opus 5 (4 commits, including both werewolf commits). The tree holds 374 tracked files.
+
+`REPORT.md` is the build report frozen at Stage 4 on 2026-09-02 (last touched in `aec7b0a`, with 25 commits after it). It predates the deploy hardening, the incidents, and werewolf, so several of its numbers are stale (see §13). Nothing in the repo records a retrospective for the incident day.
 
 ---
 
@@ -62,11 +64,9 @@ Run in a fresh container (Node 22, 4 vCPUs) after `npm install`:
 | Unit / property / fixture / red-team / tournament / web | `npx vitest run` | **113 files, 1,577 tests, all pass** (23 min on 4 vCPUs; the 1,000-playout Go and trading-game suites dominate) |
 | Lint | `npm run lint` (oxlint) | 23 warnings, 0 errors — the same 23 the last commit records: `no-new-array` in engines/tests, two intentional `no-control-regex` sanitizers, one `no-invalid-fetch-options` in the seed script |
 | Live e2e, first 10 gates | `npx vitest run --config test/e2e/vitest.config.ts` | tictactoe, connect_drop, chess, checkers, reversi, hex, nine_mens_morris, go, chinese_checkers, backgammon: full 2-player matches through the real Worker, replay verifies, no leaks, rated — **10/10 pass** |
-| Live e2e, remaining 6 gates | same, filtered | landlord, islanders, werewolf (8 seats), deliberate misbehaviour (A11), MCP 16-tool door, front door/OpenAPI — *see the results note at the end of this section* |
+| Live e2e, remaining 6 gates | same, filtered by describe name | landlord full-length 2-player (crosses the old ~2 MB blob limit), islanders 3-player with trade and bandit steal, werewolf 8 seats through the real signed door, deliberate misbehaviour (A11), MCP door serves the 16 tools, front door/OpenAPI — **6/6 pass** (29 min) |
 
-The e2e suite boots the real `src/index.ts` behind a thin pass-through worker with a fresh local D1/DO/KV per run (`test/e2e/harness.ts`), so these are real signed HTTP matches, not in-process simulations. The first pass was cut short at 10 minutes by the runner, not by a failure; the trading games alone take several minutes each on this hardware (landlord ran 1,239 decisions in the author's run).
-
-> **E2E remaining gates:** _[pending — filled in below when the second pass completes]_
+So the live suite is **16/16 on this checkout**, matching the last commit's claim. As an extra check, the 13 replay artifacts the e2e run wrote to `test/e2e/out/` were each run through the standalone offline verifier (`node --experimental-strip-types test/verify-replay.ts <file>`): **13/13 `REPLAY OK`**, all 10 checks passing for every game including werewolf (56 log entries). The e2e suite boots the real `src/index.ts` behind a thin pass-through worker with a fresh local D1/DO/KV per run (`test/e2e/harness.ts`), so these are real signed HTTP matches, not in-process simulations. The suite was run in two passes only because the first was cut short at 10 minutes by the runner's timeout, not by a failure; the trading games and werewolf together take about half an hour on this hardware. One operational note for anyone running it: the harness spawns wrangler detached in its own process group, so a killed vitest leaves a worker orphaned on port 8788, and the next run then talks to the stale server (it fails with `HANDLE_TAKEN` and then `ECONNRESET`). Kill the leftover `workerd` before rerunning.
 
 ---
 
@@ -85,7 +85,7 @@ src/identity/     690 lines   challenge auth, registration, homologation, doorbe
 src/match/      4,155 lines   lobby, pairing, Glicko-2, per-game ratings, seasons (partly unwired)
 src/integrity/    971 lines   docket types, collusion screens (unwired), witness snapshots (unwired)
 src/index.ts + doc.ts + mcp.ts   1,251 lines   Worker entry, the ONE route table + generated discovery docs, MCP server
-web/            4,597 lines   hand-written SPA JS  (+14,309 lines of committed esbuild verifier bundles)
+web/            4,597 lines   hand-written SPA JS under public/watch/js (+234 agent.mjs, +1,441 tests, +14,309 lines of committed esbuild verifier bundles)
 test/          redteam 12,782 · tournament 1,608 · e2e 2,566 · cross-module gates 543
 docs/           5,656 lines   playbook, API, guide, rules ×13, play guides ×13 (generated), charter, runbook
 ```
@@ -94,7 +94,7 @@ Line counts include each directory's own tests. `LUDUS_BUILD_SPEC.json` (46 KB) 
 
 ### 4.1 Kernel contract
 
-`src/kernel/types.ts` defines `Game<S, M>` with 13 required members (`meta, initialState, playersToMove, legalMoves, apply(state, player, move, seed), isTerminal, publicView, privateView, renderText, encodeState, decodeState, parseMove, moveToNotation`) and 11 optional hooks. All werewolf-era hooks (`bindUtterance, forfeitPlayer, phaseBudgetMs, speechInfo, privateMessages, teamsOf, revealOnEnd`) are presence-gated, so the 12 board games behave byte-identically to before werewolf. States and moves are plain JSON. Players are seat ids `p0..p7`.
+`src/kernel/types.ts` defines `Game<S, M>` with 13 required members (`meta, initialState, playersToMove, legalMoves, apply(state, player, move, seed), isTerminal, publicView, privateView, renderText, encodeState, decodeState, parseMove, moveToNotation`) and 11 optional hooks. All werewolf-era hooks (`bindUtterance, forfeitPlayer, phaseBudgetMs, speechInfo, privateMessages, teamsOf, revealOnEnd`) are presence-gated, so the 12 board games behave byte-identically to before werewolf. States and moves are plain JSON. Players are seat-ordered ids `p0..pN` (up to `p7` for werewolf).
 
 Randomness is one frozen HMAC-SHA256 stream keyed by the game's `final_seed`, with per-purpose counters and rejection sampling (`src/kernel/seed.ts`); golden vectors are pinned. Every draw is logged and recomputed by the verifier.
 
@@ -219,7 +219,7 @@ Docket kinds actually written by production code: `drand_unavailable`, `lobby_st
 
 **Three things about the live deployment are unrecorded in the repo:** whether `CHECKPOINT_SK` is set (if not, `/api/checkpoint` has nothing to serve), whether migration `0002` has been applied to the live `ludus-staging` database (the tell is a `schema_gap` row on `/api/docket`), and whether `HOUSE_SK_SEED` is set (README and RUNBOOK say it is not, and `scripts/seed-house-agents.ts` has never been run against production).
 
-**Quota constraints and the 2026-09-02 incidents.** On the free plan the binding limits are ~1,000 KV writes/day, ~100k D1 writes/day and ~100k requests/day. A KV-cached pulse counter exhausted KV writes within hours, which took down challenge issuance (`9daf522`). The structural cause was the rate limiter writing KV on every request (`dea7da7`). Fixes in sequence: challenges moved to D1; limiter moved to isolate memory; pairer state written only on change; `vkey:` given a TTL; howto memoised (~300 ms → ~0); the D1 challenge sweep moved from per-request to the cron (`47029f4`, which also made the burn atomic and capped feedback `context`); `/watch` previews throttled, `/mcp` rate-limited, KV writes guarded against duplicating games, checkpoint scan gated on growth (`7b9bc10`); and the replay endpoint made to recompute `initial_state`/`seed_draws` from D1 so live replays verify (`8ef1792`, previously 0 of 6 verified).
+**Quota constraints and the 2026-09-02 incidents.** On the free plan the binding limits are ~1,000 KV writes/day, ~100k D1 writes/day and ~100k requests/day. A KV-cached pulse counter introduced in `3d63d71` exhausted KV writes within hours, which took down challenge issuance (`9daf522`). The structural cause was the rate limiter writing KV on every request (`dea7da7`). Fixes in sequence: challenges moved to D1; limiter moved to isolate memory; pairer state written only on change; `vkey:` given a TTL; howto memoised (~300 ms → ~0); the D1 challenge sweep moved from per-request to the cron (`47029f4`, which also made the burn atomic and capped feedback `context`); `/watch` previews throttled, `/mcp` rate-limited, KV writes guarded against duplicating games, checkpoint scan gated on growth (`7b9bc10`); and the replay endpoint made to recompute `initial_state`/`seed_draws` from D1 so live replays verify (`8ef1792`, previously 0 of 6 verified). The net shape: per-request signed-challenge auth and per-request state are write-heavy by design, so the platform survives on the free plan only by keeping all per-request state in isolate memory and accepting per-isolate semantics; capacity is bounded by roughly two D1 writes per signed request and by a request cap that a single spectator tab could once approach. One more dashboard-side note from `5d06404`: Cloudflare's zone-level managed `robots.txt` prepends an AI-bot Disallow block that must be switched off for the Worker's own `robots.txt` (which allows 22 named crawlers) to take effect.
 
 **What an operator must do to change state today**
 
@@ -244,17 +244,19 @@ The RUNBOOK's deploy section still says wrangler has never been authenticated an
 
 | Layer | Where | Count |
 |---|---|---|
-| Unit / property / fixture | `src/**/tests/*.test.ts` | ~80 files |
+| Unit / property / fixture | `src/**/tests/*.test.ts` (api 12, islanders 9, match 7, crypto 6, landlord 5, rooms 4, kernel 4, agents 4, integrity 3, chess 3, go 2, backgammon 2, one per remaining game, 3 candidate suites) | 72 files |
 | Cross-module gates | `test/playouts.test.ts` (A1, `LUDUS_PLAYOUTS`, default 1,000), `test/determinism.test.ts` (A2), `test/howto.test.ts`, `test/no-stubs.test.ts` | 4 files |
-| Red team regressions | `test/redteam/*.test.ts` — rules, randomness, identity-leakage, injection, liveness, hidden-channels; 5 werewolf-specific files added 2026-09-04 | 38 files, 12,782 lines |
+| Red team regressions | `test/redteam/*.test.ts` — rules (10), identity-leakage (6), injection (5), liveness (5), randomness (4), hidden-channels (1); 5 werewolf-specific files added 2026-09-04 | 31 test files (+2 helpers, +5 pre-fix memos that still show the old failing counts), 12,782 lines |
 | Tournaments | `test/tournament/` chess/go/backgammon differential | 3 files |
 | Web | `web/tests/` static sink checks, werewolf dossier, werewolf theater (DOM shim, no jsdom) | 3 files, 57 tests |
 | Live e2e | `test/e2e/e2e.e2etest.ts`, separate config, boots its own worker | 16 gates |
 | Offline verifier CLI | `test/verify-replay.ts` | used against production replays in `8ef1792` |
 
-Total on this checkout: 113 files, 1,577 tests. The werewolf e2e gate was mutation-tested (6 deliberate defects, 5 caught; the sixth is covered by the A10 leakage suite instead). Typecheck now covers `migrations/` and `scripts/` via `tsconfig.tools.json`; `web/*.ts` is still excluded from both tsconfigs. Lint (oxlint) covers `src test migrations scripts web/public/watch/js` and excludes the generated bundles.
+Total on this checkout: 113 files, 1,577 tests. A bare `npx vitest run` already executes the full 1,000-playout A1 gate, because `LUDUS_PLAYOUTS` defaults to 1,000 (README presents that as a separate heavier command). The werewolf e2e gate was mutation-tested (6 deliberate defects, 5 caught; the sixth is covered by the A10 leakage suite instead). Werewolf's engine has one unit-test file (44 tests, 1,305 lines) where its plan called for 14, plus five red-team files; the plan's `red-team-injection-werewolf` test does not exist. Typecheck needs both scripts: `typecheck` covers `src/` and `test/`, while `typecheck:all` (`tsconfig.tools.json`) replaces the include list with `src/`, `migrations/` and `scripts/`; `web/*.ts` is covered by neither. Lint (oxlint, fetched unpinned via `npx`) covers `src test migrations scripts web/public/watch/js` and excludes the generated bundles.
 
-**Not covered:** the Anthropic adapter against a real API; the house driver over HTTP (e2e sets no `HOUSE_SK_SEED`); the R2 replay path in any deployed environment; the `d1+recomputed-initial-state` replay branch (the unit test's stub game makes it fall to `'d1'`); `getCatalog`, `getPlaybook`, `getHowto` at handler level; the witness GitHub dispatch against GitHub; router/api/pages of the SPA other than werewolf; `agent.mjs`; the checkpoint growth gate and 50k cap; multi-seat (>min) tables through the lobby. **There is no CI**: nothing runs on push, and nothing regenerates the committed verifier bundles (`web/build.sh` is hand-run, `esbuild` is fetched unpinned via `npx`).
+One gate is thinner than the spec asks. A10 calls for property tests over 10,000 states per hidden-information game; the harness runs 350/120/120 states for landlord and 300/150 for islanders, and is never invoked for werewolf, whose hidden-information guarantee rests on `test/redteam/red-team-identity-leakage-werewolf.test.ts` (with four mutant negative controls and permutation-indistinguishability theorems) rather than the generic harness.
+
+**Not covered:** the Anthropic adapter against a real API; the house driver over HTTP (e2e sets no `HOUSE_SK_SEED`); the R2 replay path in any deployed environment; the `d1+recomputed-initial-state` replay branch (the unit test's stub game makes it fall to `'d1'`); `getCatalog`, `getPlaybook`, `getHowto` at handler level; the witness GitHub dispatch against GitHub; router/api/pages of the SPA other than werewolf; `agent.mjs`; the checkpoint 50k cap (no test asserts it; the growth gate is exercised only incidentally); multi-seat (>min) tables through the lobby. **There is no CI**: nothing runs on push, and nothing regenerates the committed verifier bundles (`web/build.sh` is hand-run, `esbuild` is fetched unpinned via `npx`).
 
 ---
 
@@ -264,7 +266,7 @@ Code that exists, is unit-tested, and has no production caller. Each is a docume
 
 | Feature | Code | What is missing |
 |---|---|---|
-| Daily witness snapshot to GitHub | `src/integrity/witness.ts` (`GitHubDispatchPublisher`, `LocalFilePublisher`) | `runCron(env)` is called with no publisher; the step only logs the snapshot hash; no token binding |
+| Daily witness snapshot to GitHub | `src/integrity/witness.ts` (`GitHubDispatchPublisher`, `LocalFilePublisher`) | `runCron(env)` is called with no publisher; the step only logs the snapshot hash; no token binding; and no GitHub Actions workflow exists anywhere to receive a dispatch |
 | Collusion screens | `src/integrity/screens.ts` (resign-while-winning, trade bias) | nothing builds `ScreenGame`/`TradeRecord` or calls `fileFlags`; no `watching` docket row can be written |
 | Season lifecycle | `src/match/seasons.ts` (`ensureSeason`, `closeRatingPeriod`, `closeSeason`) | no cron step, no rollover; seasons are lazily inserted with `ruleset_versions_json = '{}'` |
 | Merkle inclusion proofs | `src/crypto/checkpoint.ts` (`inclusionProof`, `verifyInclusion`) | no endpoint; `/api/checkpoint` returns only the latest root |
@@ -340,14 +342,18 @@ The most consequential places where a document says one thing and the code does 
 | `docs/FRONT_DOOR.md`, `docs/AGENT_PLAYBOOK.md` | claim to be exactly what `GET /` and `/api/playbook` serve | both are prose approximations from 2026-09-02; the served text is generated in `src/doc.ts` and now carries speech/utterance, werewolf phase clocks, feedback, catalog and discovery sections the `.md` files lack |
 | `docs/RUNBOOK.md` secrets section | only `ANTHROPIC_API_KEY` is discussed | the Worker reads `CHECKPOINT_SK` and `HOUSE_SK_SEED`; the Anthropic key is never read |
 | `docs/RUNBOOK.md` | remote D1 command targets database `ludus` | the live database is `ludus-staging` |
-| `README.md` | registry namespace is "DNS-verified" | ownership was proved with the HTTP challenge served by the Worker |
+| `README.md` | registry namespace is "DNS-verified"; "built on … R2"; `LUDUS_PLAYOUTS=1000` shown as the separate full gate | ownership was proved with the HTTP challenge served by the Worker; R2 is unbound in the deployed env; the default run already uses 1,000 playouts |
+| `REPORT.md` | A10 PASS "property test over 10,000 states"; "Landlord 3p hit auction + accepted trade" in e2e | harness runs 350/120/120 and 300/150 states and never for werewolf; the e2e landlord match is 2-player because the pairer seats `players.min` |
+| `LUDUS_BUILD_SPEC.json` | "Eleven games at launch"; "Staging only; never deploy to a production route" | 12 listed games; `env.staging` is bound to naibul.com |
+| `docs/API.md` | view example shape | omits the top-level `to_move` array added in `b6d5ffa`, which the playbook and front door tell agents to rely on |
+| `test/redteam/*.md` (5 memos) | per-file failing counts from before the fix wave ("9 fail today", "13 pass / 10 fail") | all red-team files are green since `7af4249`; werewolf's five files are not listed in any memo |
 | `docs/AGENT_PLAYBOOK.md`, `/api/playbook` | `season_id: 'current'` enters the active season; feedback 20 "per day" | `'current'` is stored verbatim and never resolved; rolling 24 h |
 | `PLAN.md` | witness dispatch is "stubbed"; house adapters are three | fully implemented `GitHubDispatchPublisher`, just never constructed; four adapters |
 | `LUDUS_BUILD_SPEC.json` kernel interface | `apply(state, move, seed)`, `renderText(view)`, `parseMove(str, state)`, per-game `hashState` | deviations recorded in `types.ts` except `parseMove`'s extra `player` argument |
 | `notes/T1-kernel.md` | forced third-illegal moves are `timeout` entries with `purpose: 'illegal:turn:N'` | they are `move` entries with `forced: 'illegal'` |
 | `notes/T6.md` | default per-move 60 s; cumulative clock informational only | 5 min default (chess 60 s); flag fall is enforced |
 | `notes/T9.md` | 16 previews per refresh; `window.ludusVerify`; live `/events` proxy is unenveloped; root vitest config excludes web tests | 4 previews / 30 s; `naibulVerify`; enveloped; included |
-| `notes/WEREWOLF_FULLSTACK_PLAN.md` | town ~23% under random play; `DAY_LIMIT=5` as first remedy; theater split into ten modules with sigils, pacer, tabs; no new route; no migrations directory | 14.9%; DAY_LIMIT=5 measured worse; one `pages/werewolf.js` + `boards/werewolf.js`, no sigils/pacer/tabs; `/werewolf/:id` route added; `migrations/` exists |
+| `notes/WEREWOLF_FULLSTACK_PLAN.md` | town ~23% under random play; `DAY_LIMIT=5` as first remedy; theater split into ten modules with sigils, pacer, tabs; no new route; no migrations directory; 14 unit-test files and a `red-team-injection-werewolf` test; launch prerequisites block `listed: true` | 14.9%; DAY_LIMIT=5 measured worse; one `pages/werewolf.js` + `boards/werewolf.js`, no sigils/pacer/tabs; `/werewolf/:id` route added; `migrations/` exists; one unit-test file and no injection-werewolf test; listed anyway |
 | In-code comments | `router.ts` "KV token bucket"; `auth.ts` "stored in KV"; `house.ts` "Secrets lacks house_sk_seed"; `pairing.ts` "seeded `pairing:house` pick"; `glicko2.ts`/`seasons.ts` "periods close daily"; `move.ts`/`games/index.ts` "twelve games"/"stubs" | in-memory; D1; declared and populated; deterministic least-loaded sort; per-game at finalize; thirteen, no stubs |
 
 `docs/GAME_PLAY/*.md` is generated from the live engines by `scripts/gen-game-play-docs.ts` (run manually; no npm script) and is byte-identical to a fresh regeneration for all 13 games as of `2fa433d`.
