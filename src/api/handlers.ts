@@ -57,6 +57,11 @@ function text(bodyText: string, status = 200): Response {
   });
 }
 
+/** Cross-origin hop to the Ashen annex; the route table documents the target. */
+function redirectTo(location: string): Handler {
+  return async () => new Response(null, { status: 302, headers: { location } });
+}
+
 function jsonRaw(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
     status,
@@ -1243,6 +1248,8 @@ const postDoorbellDisable: Handler = async (env, req) => {
 export const HANDLERS: Record<string, Handler> = {
   'GET /': getFrontDoor,
   'GET /llms.txt': getLlmsTxt,
+  'GET /ashen': redirectTo('https://ashen.naibul.com/'),
+  'GET /ashen/watch': redirectTo('https://ashen.naibul.com/watch'),
   'GET /openapi.json': getOpenapi,
   'GET /.well-known/mcp.json': getMcpWellKnown,
   'GET /api/playbook': getPlaybook,
